@@ -105,6 +105,7 @@ pub(crate) fn handle_key(
 ) -> KeyAction {
     let len = entries.len();
     let page_step = cmp::max(1, page_size.saturating_sub(1));
+    const HORIZONTAL_SCROLL_STEP: usize = 16;
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -129,8 +130,12 @@ pub(crate) fn handle_key(
                 return KeyAction::Quit;
             }
         }
-        KeyCode::Left => state.x_offset = state.x_offset.saturating_sub(4),
-        KeyCode::Right => state.x_offset = state.x_offset.saturating_add(4),
+        KeyCode::Left => {
+            state.x_offset = state.x_offset.saturating_sub(HORIZONTAL_SCROLL_STEP);
+        }
+        KeyCode::Right => {
+            state.x_offset = state.x_offset.saturating_add(HORIZONTAL_SCROLL_STEP);
+        }
         KeyCode::Home => state.move_selected_to(0, len, page_size),
         KeyCode::End => state.move_selected_to(len.saturating_sub(1), len, page_size),
         KeyCode::Up => state.move_selected_by(-1, len, page_size),
@@ -973,6 +978,23 @@ mod tests {
 
         handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5);
         assert!(state.show_spans);
+    }
+
+    #[test]
+    fn left_and_right_scroll_horizontally_by_sixteen_columns() {
+        let entries = entries(1);
+        let mut state = ViewState::new();
+
+        assert_eq!(state.x_offset, 0);
+
+        handle_key(key(KeyCode::Right), &entries, &mut state, false, 5);
+        assert_eq!(state.x_offset, 16);
+
+        handle_key(key(KeyCode::Right), &entries, &mut state, false, 5);
+        assert_eq!(state.x_offset, 32);
+
+        handle_key(key(KeyCode::Left), &entries, &mut state, false, 5);
+        assert_eq!(state.x_offset, 16);
     }
 
     #[test]

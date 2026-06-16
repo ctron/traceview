@@ -11,6 +11,14 @@ log lines selectable, searchable by eye, and copyable from inside the terminal.
 
 ## Install
 
+Install a prebuilt binary with `cargo-binstall`:
+
+```sh
+cargo binstall traceviewer
+```
+
+Or build from source with Cargo:
+
 ```sh
 cargo install traceviewer
 ```
