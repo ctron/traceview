@@ -1,0 +1,1149 @@
+use std::{cmp, collections::VecDeque, io::Write, process::ExitStatus};
+
+use anyhow::Result;
+use crossterm::{
+    cursor::{Hide, MoveTo},
+    event::{KeyCode, KeyEvent, KeyModifiers},
+    queue,
+    style::{
+        Attribute, Color, Print, PrintStyledContent, ResetColor, SetAttribute, SetBackgroundColor,
+        SetForegroundColor, StyledContent, Stylize, style,
+    },
+    terminal::{self, Clear, ClearType},
+};
+
+use crate::model::{Level, LogEntry, Stream};
+
+#[derive(Debug, Default)]
+pub(crate) struct ViewState {
+    pub(crate) x_offset: usize,
+    pub(crate) first_visible: usize,
+    pub(crate) selected: Option<usize>,
+    pub(crate) help_visible: bool,
+}
+
+impl ViewState {
+    pub(crate) fn follow_latest(&mut self, len: usize, page_size: usize) {
+        self.selected = len.checked_sub(1);
+        self.scroll_selected_into_view(len, page_size);
+    }
+
+    pub(crate) fn remove_first_line(&mut self) {
+        self.first_visible = self.first_visible.saturating_sub(1);
+        self.selected = self.selected.map(|selected| selected.saturating_sub(1));
+    }
+
+    fn move_selected_to(&mut self, selected: usize, len: usize, page_size: usize) {
+        self.selected = if len == 0 {
+            None
+        } else {
+            Some(cmp::min(selected, len - 1))
+        };
+        self.scroll_selected_into_view(len, page_size);
+    }
+
+    fn move_selected_by(&mut self, delta: isize, len: usize, page_size: usize) {
+        let Some(selected) = self.selected.or_else(|| len.checked_sub(1)) else {
+            return;
+        };
+        let selected = if delta.is_negative() {
+            selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            cmp::min(
+                selected.saturating_add(delta as usize),
+                len.saturating_sub(1),
+            )
+        };
+
+        self.move_selected_to(selected, len, page_size);
+    }
+
+    fn scroll_selected_into_view(&mut self, len: usize, page_size: usize) {
+        let Some(selected) = self.selected else {
+            self.first_visible = 0;
+            return;
+        };
+        if len == 0 {
+            self.first_visible = 0;
+            self.selected = None;
+            return;
+        }
+
+        let page_size = cmp::max(1, page_size);
+        let max_first_visible = len.saturating_sub(page_size);
+        self.first_visible = cmp::min(self.first_visible, max_first_visible);
+
+        if selected < self.first_visible {
+            self.first_visible = selected;
+        } else if selected >= self.first_visible.saturating_add(page_size) {
+            self.first_visible = selected.saturating_add(1).saturating_sub(page_size);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyAction {
+    Continue,
+    CopySelected,
+    Quit,
+}
+
+pub(crate) fn handle_key(
+    key: KeyEvent,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    process_exited: bool,
+    page_size: usize,
+) -> KeyAction {
+    let len = entries.len();
+    let page_step = cmp::max(1, page_size.saturating_sub(1));
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return KeyAction::Quit;
+        }
+        KeyCode::Char('?') => {
+            state.help_visible = !state.help_visible;
+            return KeyAction::Continue;
+        }
+        KeyCode::Esc | KeyCode::Char('q') if state.help_visible => {
+            state.help_visible = false;
+            return KeyAction::Continue;
+        }
+        _ if state.help_visible => return KeyAction::Continue,
+        KeyCode::Char('y') => return KeyAction::CopySelected,
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if process_exited {
+                return KeyAction::Quit;
+            }
+        }
+        KeyCode::Left => state.x_offset = state.x_offset.saturating_sub(4),
+        KeyCode::Right => state.x_offset = state.x_offset.saturating_add(4),
+        KeyCode::Home => state.move_selected_to(0, len, page_size),
+        KeyCode::End => state.move_selected_to(len.saturating_sub(1), len, page_size),
+        KeyCode::Up => state.move_selected_by(-1, len, page_size),
+        KeyCode::Down => state.move_selected_by(1, len, page_size),
+        KeyCode::PageUp => state.move_selected_by(-(page_step as isize), len, page_size),
+        KeyCode::PageDown => state.move_selected_by(page_step as isize, len, page_size),
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+pub(crate) fn draw(
+    stdout: &mut impl Write,
+    entries: &VecDeque<LogEntry>,
+    state: &ViewState,
+    exit_status: Option<ExitStatus>,
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let content_rows = rows.saturating_sub(1) as usize;
+    if state.help_visible {
+        queue!(stdout, Hide, Clear(ClearType::All))?;
+        draw_help_page(stdout, cols, content_rows)?;
+        let status = status_line(entries.len(), state, exit_status, cols as usize);
+        queue!(
+            stdout,
+            MoveTo(0, rows.saturating_sub(1)),
+            PrintStyledContent(status.reverse())
+        )?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
+    let log_width = (cols as usize).saturating_sub(scrollbar_width);
+    let selected = state
+        .selected
+        .unwrap_or_else(|| entries.len().saturating_sub(1));
+    let start = cmp::min(
+        state.first_visible,
+        entries.len().saturating_sub(content_rows),
+    );
+    let end = cmp::min(start + content_rows, entries.len());
+
+    queue!(stdout, Hide, Clear(ClearType::All))?;
+
+    for (screen_row, idx) in (start..end).enumerate() {
+        let Some(entry) = entries.get(idx) else {
+            continue;
+        };
+        queue!(stdout, MoveTo(0, screen_row as u16))?;
+        draw_entry(stdout, entry, state.x_offset, log_width, idx == selected)?;
+    }
+
+    if scrollbar_width > 0 {
+        draw_scrollbar(
+            stdout,
+            entries,
+            start,
+            end,
+            content_rows,
+            cols.saturating_sub(1),
+        )?;
+    }
+
+    let status = status_line(entries.len(), state, exit_status, cols as usize);
+    queue!(
+        stdout,
+        MoveTo(0, rows.saturating_sub(1)),
+        PrintStyledContent(status.reverse())
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn draw_scrollbar(
+    stdout: &mut impl Write,
+    entries: &VecDeque<LogEntry>,
+    visible_start: usize,
+    visible_end: usize,
+    height: usize,
+    column: u16,
+) -> Result<()> {
+    for row in 0..height {
+        let slice = ScrollbarSlice::new(row, height, entries.len());
+        let in_view = slice.start < visible_end && slice.end > visible_start;
+        let color = scrollbar_slice_color(entries, slice.start, slice.end);
+        let marker = if in_view { "#" } else { "|" };
+        let mut styled = style(marker).with(color);
+        if in_view {
+            styled = styled.attribute(Attribute::Bold);
+        }
+
+        queue!(
+            stdout,
+            MoveTo(column, row as u16),
+            PrintStyledContent(styled)
+        )?;
+    }
+
+    Ok(())
+}
+
+fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Result<()> {
+    let lines = [
+        "tv help",
+        "",
+        "Navigation",
+        "  Up / Down       move cursor one line",
+        "  PgUp / PgDown   move cursor one page",
+        "  Home / Pos1     move cursor to first retained line",
+        "  End             move cursor to last retained line",
+        "  Left / Right    scroll horizontally",
+        "",
+        "Actions",
+        "  y               copy selected line to clipboard",
+        "  ?               toggle this help page",
+        "  q / Esc         close help, or exit after the process ends",
+        "  Ctrl-C          kill process and exit",
+    ];
+
+    for (row, line) in lines.iter().take(content_rows).enumerate() {
+        let color = match *line {
+            "tv help" | "Navigation" | "Actions" => Color::Cyan,
+            _ => Color::White,
+        };
+        queue!(
+            stdout,
+            MoveTo(0, row as u16),
+            PrintStyledContent(visible_slice(line, 0, cols as usize).with(color))
+        )?;
+    }
+
+    Ok(())
+}
+
+fn draw_entry(
+    stdout: &mut impl Write,
+    entry: &LogEntry,
+    x_offset: usize,
+    width: usize,
+    selected: bool,
+) -> Result<()> {
+    let mut parts = Vec::new();
+    push_entry_parts(&mut parts, entry);
+
+    let mut rendered = String::new();
+    for (text, _, _) in &parts {
+        rendered.push_str(text);
+    }
+    let rendered_width = rendered.chars().count();
+    if width == 0 {
+        return Ok(());
+    }
+
+    let viewport = LineViewport::new(rendered_width, x_offset, width);
+    let content_width = viewport.content_width;
+    let visible = visible_slice(&rendered, x_offset, content_width);
+    let mut cursor = 0usize;
+
+    if viewport.show_left_marker {
+        print_segment(stdout, "<".to_string(), Color::DarkGrey, true, selected)?;
+    }
+
+    for (text, color, bold) in parts {
+        let part_start = cursor;
+        let part_end = cursor + text.chars().count();
+        cursor = part_end;
+
+        let overlap_start = cmp::max(part_start, x_offset);
+        let overlap_end = cmp::min(part_end, x_offset.saturating_add(content_width));
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let local_start = overlap_start - part_start;
+        let local_len = overlap_end - overlap_start;
+        let segment: String = text.chars().skip(local_start).take(local_len).collect();
+        print_segment(stdout, segment, color, bold, selected)?;
+    }
+
+    let remaining = content_width.saturating_sub(visible.chars().count());
+    if remaining > 0 {
+        print_segment(stdout, " ".repeat(remaining), Color::White, false, selected)?;
+    }
+
+    if viewport.show_right_marker {
+        print_segment(stdout, ">".to_string(), Color::DarkGrey, true, selected)?;
+    }
+
+    if selected {
+        queue!(stdout, ResetColor)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn selected_line_text(
+    entries: &VecDeque<LogEntry>,
+    state: &ViewState,
+) -> Option<String> {
+    let entry = entries.get(state.selected?)?;
+    let mut parts = Vec::new();
+    push_entry_parts(&mut parts, entry);
+    Some(parts.into_iter().map(|(text, _, _)| text).collect())
+}
+
+fn push_entry_parts(parts: &mut Vec<(String, Color, bool)>, entry: &LogEntry) {
+    parts.push((
+        format!("{} ", entry.stream.indicator()),
+        stream_color(entry.stream),
+        true,
+    ));
+    if let Some(timestamp) = &entry.timestamp {
+        parts.push((format!("{timestamp} "), Color::DarkGrey, false));
+    }
+    if entry.parsed {
+        parts.push((
+            format!("{:<5} ", entry.level.label()),
+            level_color(entry.level),
+            true,
+        ));
+    }
+    if let Some(target) = &entry.target {
+        push_target_parts(parts, target);
+    }
+    push_span_parts(parts, &entry.spans);
+    push_message_parts(parts, &entry.message, message_color(entry));
+}
+
+fn push_target_parts(parts: &mut Vec<(String, Color, bool)>, target: &str) {
+    let split_at = target
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(target.len());
+    let (module_path, suffix) = target.split_at(split_at);
+
+    let mut modules = module_path.split("::").peekable();
+    while let Some(module) = modules.next() {
+        parts.push((module.to_string(), target_module_color(module), false));
+        if modules.peek().is_some() {
+            parts.push(("::".to_string(), Color::DarkGrey, false));
+        }
+    }
+    if !suffix.is_empty() {
+        parts.push((suffix.to_string(), Color::DarkGrey, false));
+    }
+    parts.push((": ".to_string(), Color::DarkGrey, false));
+}
+
+fn push_span_parts(parts: &mut Vec<(String, Color, bool)>, spans: &[String]) {
+    for span in spans {
+        push_span_part(parts, span);
+        parts.push((": ".to_string(), Color::DarkGrey, false));
+    }
+}
+
+fn push_span_part(parts: &mut Vec<(String, Color, bool)>, span: &str) {
+    if let Some(open) = span.find('{') {
+        let (name, fields) = span.split_at(open);
+        parts.push((name.to_string(), span_name_color(name), false));
+        push_span_fields(parts, fields);
+    } else {
+        parts.push((span.to_string(), span_name_color(span), false));
+    }
+}
+
+fn push_span_fields(parts: &mut Vec<(String, Color, bool)>, fields: &str) {
+    let mut current = String::new();
+    let mut token = String::new();
+    let mut chars = fields.chars().peekable();
+    let mut in_string = false;
+    let mut expecting_key = true;
+    let mut expecting_value = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            token.push(ch);
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            } else if ch == '"' {
+                parts.push((std::mem::take(&mut token), string_color(), false));
+                in_string = false;
+                expecting_value = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                token.push(ch);
+                in_string = true;
+            }
+            '=' | ':' => {
+                flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                parts.push((ch.to_string(), span_punctuation_color(), false));
+                expecting_key = false;
+                expecting_value = true;
+            }
+            '{' | '}' | '(' | ')' | '[' | ']' | ',' => {
+                flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                parts.push((ch.to_string(), span_punctuation_color(), false));
+                expecting_key = matches!(ch, '{' | ',' | '(');
+                expecting_value = false;
+            }
+            ch if ch.is_whitespace() => {
+                flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                current.push(ch);
+                if !current.is_empty() {
+                    parts.push((std::mem::take(&mut current), Color::Reset, false));
+                }
+                expecting_key = !expecting_value;
+            }
+            _ => token.push(ch),
+        }
+    }
+
+    if in_string {
+        parts.push((token, string_color(), false));
+    } else {
+        flush_span_token(parts, &mut token, expecting_key, expecting_value);
+    }
+}
+
+fn flush_span_token(
+    parts: &mut Vec<(String, Color, bool)>,
+    token: &mut String,
+    expecting_key: bool,
+    expecting_value: bool,
+) {
+    if token.is_empty() {
+        return;
+    }
+
+    let color = if expecting_key {
+        span_key_color()
+    } else if expecting_value {
+        span_value_color(token)
+    } else {
+        Color::Reset
+    };
+    parts.push((std::mem::take(token), color, false));
+}
+
+fn push_message_parts(parts: &mut Vec<(String, Color, bool)>, message: &str, base_color: Color) {
+    let mut current = String::new();
+    let mut chars = message.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+
+        if ch == '\\' && in_string {
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
+            continue;
+        }
+
+        if ch != '"' {
+            continue;
+        }
+
+        if in_string {
+            parts.push((std::mem::take(&mut current), string_color(), false));
+            in_string = false;
+        } else {
+            if current.len() > ch.len_utf8() {
+                let quote = current.split_off(current.len() - ch.len_utf8());
+                parts.push((std::mem::take(&mut current), base_color, false));
+                current = quote;
+            }
+            in_string = true;
+        }
+    }
+
+    if !current.is_empty() {
+        let color = if in_string {
+            string_color()
+        } else {
+            base_color
+        };
+        parts.push((current, color, false));
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LineViewport {
+    content_width: usize,
+    show_left_marker: bool,
+    show_right_marker: bool,
+}
+
+impl LineViewport {
+    fn new(line_width: usize, x_offset: usize, terminal_width: usize) -> Self {
+        let show_left_marker = x_offset > 0 && terminal_width > 1;
+        let mut content_width = terminal_width.saturating_sub(usize::from(show_left_marker));
+        let show_right_marker =
+            line_width > x_offset.saturating_add(content_width) && content_width > 0;
+        content_width = content_width.saturating_sub(usize::from(show_right_marker));
+
+        Self {
+            content_width,
+            show_left_marker,
+            show_right_marker,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ScrollbarSlice {
+    start: usize,
+    end: usize,
+}
+
+impl ScrollbarSlice {
+    fn new(row: usize, height: usize, entries: usize) -> Self {
+        if height == 0 || entries == 0 {
+            return Self { start: 0, end: 0 };
+        }
+
+        let start = row.saturating_mul(entries) / height;
+        let mut end = (row.saturating_add(1))
+            .saturating_mul(entries)
+            .div_ceil(height);
+        end = cmp::min(cmp::max(end, start.saturating_add(1)), entries);
+
+        Self { start, end }
+    }
+}
+
+fn print_segment(
+    stdout: &mut impl Write,
+    text: String,
+    color: Color,
+    bold: bool,
+    selected: bool,
+) -> Result<()> {
+    if selected {
+        queue!(
+            stdout,
+            SetBackgroundColor(selected_background()),
+            SetForegroundColor(selected_foreground(color))
+        )?;
+        if bold {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print(text))?;
+        if bold {
+            queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+        }
+    } else {
+        queue!(stdout, PrintStyledContent(apply_style(text, color, bold)))?;
+    }
+
+    Ok(())
+}
+
+fn apply_style(text: String, color: Color, bold: bool) -> StyledContent<String> {
+    let mut styled = style(text).with(color);
+    if bold {
+        styled = styled.attribute(Attribute::Bold);
+    }
+    styled
+}
+
+fn selected_background() -> Color {
+    Color::Rgb {
+        r: 64,
+        g: 64,
+        b: 64,
+    }
+}
+
+fn selected_foreground(color: Color) -> Color {
+    match color {
+        Color::Red => Color::DarkRed,
+        Color::Yellow => Color::DarkYellow,
+        Color::Green => Color::DarkGreen,
+        Color::Blue => Color::DarkBlue,
+        Color::Cyan => Color::DarkCyan,
+        Color::White | Color::Grey => Color::Reset,
+        other => other,
+    }
+}
+
+fn status_line(
+    entries: usize,
+    state: &ViewState,
+    exit_status: Option<ExitStatus>,
+    width: usize,
+) -> String {
+    let selected = state.selected.map(|idx| idx + 1).unwrap_or(0);
+    let follow = if state.selected.is_some_and(|idx| idx + 1 == entries) {
+        " | auto-scroll"
+    } else {
+        ""
+    };
+    let process = match exit_status {
+        Some(status) => format!("exited {status}"),
+        None => "running".to_string(),
+    };
+
+    let status = format!(
+        " {process} | line {selected}/{entries}{follow} | x={} | ? help ",
+        state.x_offset
+    );
+    visible_slice(&format!("{status:<width$}"), 0, width)
+}
+
+fn level_color(level: Level) -> Color {
+    match level {
+        Level::Trace => Color::DarkGrey,
+        Level::Debug => Color::Cyan,
+        Level::Info => Color::Green,
+        Level::Warn => Color::Yellow,
+        Level::Error => Color::Red,
+        Level::Unknown => Color::White,
+    }
+}
+
+fn stream_color(stream: Stream) -> Color {
+    match stream {
+        Stream::Stdout => Color::DarkGrey,
+        Stream::Stderr => Color::Yellow,
+    }
+}
+
+fn string_color() -> Color {
+    Color::Rgb {
+        r: 206,
+        g: 145,
+        b: 120,
+    }
+}
+
+fn span_name_color(span: &str) -> Color {
+    span_palette_color(stable_hash(span) % SPAN_PALETTE_SIZE)
+}
+
+const SPAN_PALETTE_SIZE: usize = 64;
+
+fn span_palette_color(index: usize) -> Color {
+    let hue = (index as f32 * 360.0 / SPAN_PALETTE_SIZE as f32 + 18.0) % 360.0;
+    let (r, g, b) = hsl_to_rgb(hue, 0.34, 0.62);
+
+    Color::Rgb { r, g, b }
+}
+
+fn span_key_color() -> Color {
+    Color::Rgb {
+        r: 156,
+        g: 220,
+        b: 254,
+    }
+}
+
+fn span_punctuation_color() -> Color {
+    Color::Rgb {
+        r: 150,
+        g: 150,
+        b: 150,
+    }
+}
+
+fn span_value_color(value: &str) -> Color {
+    if matches!(value, "true" | "false") {
+        Color::Rgb {
+            r: 86,
+            g: 156,
+            b: 214,
+        }
+    } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        Color::Rgb {
+            r: 181,
+            g: 206,
+            b: 168,
+        }
+    } else {
+        Color::Reset
+    }
+}
+
+fn target_module_color(module: &str) -> Color {
+    target_palette_color(stable_hash(module) % TARGET_PALETTE_SIZE)
+}
+
+const TARGET_PALETTE_SIZE: usize = 128;
+
+fn target_palette_color(index: usize) -> Color {
+    let hue = (index as f32 * 360.0 / TARGET_PALETTE_SIZE as f32) % 360.0;
+    let saturation = 0.48 + ((index / 32) as f32 * 0.09);
+    let lightness = 0.58 + ((index / 16) % 2) as f32 * 0.10;
+    let (r, g, b) = hsl_to_rgb(hue, saturation.min(0.78), lightness.min(0.72));
+
+    Color::Rgb { r, g, b }
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let hue_sector = hue / 60.0;
+    let x = chroma * (1.0 - (hue_sector % 2.0 - 1.0).abs());
+
+    let (r1, g1, b1) = match hue_sector as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+
+    let m = lightness - chroma / 2.0;
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
+}
+
+fn stable_hash(value: &str) -> usize {
+    value.bytes().fold(2_166_136_261usize, |hash, byte| {
+        hash.wrapping_mul(16_777_619) ^ byte as usize
+    })
+}
+
+fn message_color(entry: &LogEntry) -> Color {
+    match (entry.level, entry.stream) {
+        (Level::Error, _) => Color::Red,
+        (Level::Warn, _) => Color::Yellow,
+        (Level::Unknown, Stream::Stderr) => Color::Yellow,
+        _ => Color::White,
+    }
+}
+
+fn scrollbar_slice_color(entries: &VecDeque<LogEntry>, start: usize, end: usize) -> Color {
+    entries
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|entry| entry.level)
+        .max_by_key(|level| level.severity())
+        .map(level_scrollbar_color)
+        .unwrap_or(Color::DarkGrey)
+}
+
+fn level_scrollbar_color(level: Level) -> Color {
+    match level {
+        Level::Error => Color::Red,
+        Level::Warn => Color::Yellow,
+        Level::Info => Color::Green,
+        Level::Debug => Color::Cyan,
+        Level::Trace => Color::DarkGrey,
+        Level::Unknown => Color::DarkGrey,
+    }
+}
+
+fn visible_slice(input: &str, offset: usize, width: usize) -> String {
+    input.chars().skip(offset).take(width).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(count: usize) -> VecDeque<LogEntry> {
+        (0..count)
+            .map(|idx| LogEntry {
+                timestamp: None,
+                level: Level::Info,
+                parsed: true,
+                target: None,
+                spans: Vec::new(),
+                message: format!("line {idx}"),
+                stream: Stream::Stdout,
+            })
+            .collect()
+    }
+
+    fn entry_with_level(level: Level) -> LogEntry {
+        LogEntry {
+            timestamp: None,
+            level,
+            parsed: true,
+            target: None,
+            spans: Vec::new(),
+            message: "line".to_string(),
+            stream: Stream::Stdout,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn home_and_end_move_to_first_and_last_lines() {
+        let entries = entries(10);
+        let mut state = ViewState::default();
+
+        handle_key(key(KeyCode::Home), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(0));
+
+        handle_key(key(KeyCode::End), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(9));
+    }
+
+    #[test]
+    fn page_keys_move_by_visible_page() {
+        let entries = entries(20);
+        let mut state = ViewState::default();
+
+        assert_eq!(
+            handle_key(key(KeyCode::PageUp), &entries, &mut state, false, 6),
+            KeyAction::Continue
+        );
+        assert_eq!(state.selected, Some(14));
+
+        handle_key(key(KeyCode::PageDown), &entries, &mut state, false, 6);
+        assert_eq!(state.selected, Some(19));
+    }
+
+    #[test]
+    fn y_requests_copy_selected_line() {
+        let entries = entries(1);
+        let mut state = ViewState::default();
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('y')), &entries, &mut state, false, 5),
+            KeyAction::CopySelected
+        );
+    }
+
+    #[test]
+    fn question_mark_toggles_help_page() {
+        let entries = entries(1);
+        let mut state = ViewState::default();
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('?')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(state.help_visible);
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('?')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(!state.help_visible);
+    }
+
+    #[test]
+    fn help_page_ignores_navigation_until_closed() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            help_visible: true,
+            selected: Some(9),
+            first_visible: 5,
+            ..ViewState::default()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Up), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert_eq!(state.selected, Some(9));
+        assert!(state.help_visible);
+
+        handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5);
+        assert!(!state.help_visible);
+    }
+
+    #[test]
+    fn selected_line_text_matches_rendered_plain_text() {
+        let entries = VecDeque::from([LogEntry {
+            timestamp: Some("2026-06-15T12:01:02Z".to_string()),
+            level: Level::Info,
+            parsed: true,
+            target: Some("my_crate::worker".to_string()),
+            spans: vec!["request{id=7}".to_string()],
+            message: "loaded \"user\"".to_string(),
+            stream: Stream::Stdout,
+        }]);
+        let state = ViewState {
+            selected: Some(0),
+            ..ViewState::default()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| 2026-06-15T12:01:02Z INFO  my_crate::worker: request{id=7}: loaded \"user\"")
+        );
+    }
+
+    #[test]
+    fn cursor_moves_on_screen_before_scrolling_up() {
+        let entries = entries(10);
+        let mut state = ViewState::default();
+        state.follow_latest(entries.len(), 5);
+
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(8));
+        assert_eq!(state.first_visible, 5);
+
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(5));
+        assert_eq!(state.first_visible, 5);
+
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(4));
+        assert_eq!(state.first_visible, 4);
+    }
+
+    #[test]
+    fn cursor_moves_on_screen_before_scrolling_down() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            first_visible: 2,
+            selected: Some(2),
+            ..ViewState::default()
+        };
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(state.first_visible, 2);
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(6));
+        assert_eq!(state.first_visible, 2);
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(7));
+        assert_eq!(state.first_visible, 3);
+    }
+
+    #[test]
+    fn line_viewport_marks_hidden_content_on_the_right() {
+        assert_eq!(
+            LineViewport::new(20, 0, 10),
+            LineViewport {
+                content_width: 9,
+                show_left_marker: false,
+                show_right_marker: true,
+            }
+        );
+    }
+
+    #[test]
+    fn line_viewport_marks_hidden_content_on_both_sides() {
+        assert_eq!(
+            LineViewport::new(20, 5, 10),
+            LineViewport {
+                content_width: 8,
+                show_left_marker: true,
+                show_right_marker: true,
+            }
+        );
+    }
+
+    #[test]
+    fn line_viewport_omits_markers_when_line_fits() {
+        assert_eq!(
+            LineViewport::new(8, 0, 10),
+            LineViewport {
+                content_width: 10,
+                show_left_marker: false,
+                show_right_marker: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scrollbar_slice_maps_row_to_entry_range() {
+        assert_eq!(
+            ScrollbarSlice::new(0, 5, 10),
+            ScrollbarSlice { start: 0, end: 2 }
+        );
+        assert_eq!(
+            ScrollbarSlice::new(2, 5, 10),
+            ScrollbarSlice { start: 4, end: 6 }
+        );
+        assert_eq!(
+            ScrollbarSlice::new(4, 5, 10),
+            ScrollbarSlice { start: 8, end: 10 }
+        );
+    }
+
+    #[test]
+    fn scrollbar_slice_color_uses_highest_severity() {
+        let entries = VecDeque::from([
+            entry_with_level(Level::Info),
+            entry_with_level(Level::Debug),
+            entry_with_level(Level::Warn),
+            entry_with_level(Level::Error),
+        ]);
+
+        assert_eq!(scrollbar_slice_color(&entries, 0, 2), Color::Green);
+        assert_eq!(scrollbar_slice_color(&entries, 0, 3), Color::Yellow);
+        assert_eq!(scrollbar_slice_color(&entries, 0, 4), Color::Red);
+    }
+
+    #[test]
+    fn target_module_colors_are_stable_for_same_module() {
+        assert_eq!(target_module_color("worker"), target_module_color("worker"));
+    }
+
+    #[test]
+    fn target_palette_has_128_slots() {
+        assert_eq!(TARGET_PALETTE_SIZE, 128);
+        assert_ne!(target_palette_color(0), target_palette_color(127));
+    }
+
+    #[test]
+    fn target_parts_split_rust_modules_and_keep_separators_neutral() {
+        let mut parts = Vec::new();
+        push_target_parts(&mut parts, "my_crate::worker::db");
+
+        let text: String = parts.iter().map(|(text, _, _)| text.as_str()).collect();
+        assert_eq!(text, "my_crate::worker::db: ");
+        assert_eq!(parts[1], ("::".to_string(), Color::DarkGrey, false));
+        assert_eq!(parts[3], ("::".to_string(), Color::DarkGrey, false));
+        assert_eq!(parts[5], (": ".to_string(), Color::DarkGrey, false));
+    }
+
+    #[test]
+    fn target_parts_do_not_split_modules_after_first_whitespace() {
+        let mut parts = Vec::new();
+        push_target_parts(&mut parts, "my_crate::worker span{path=other::module}");
+
+        let text: String = parts.iter().map(|(text, _, _)| text.as_str()).collect();
+        assert_eq!(text, "my_crate::worker span{path=other::module}: ");
+        assert_eq!(
+            parts[3],
+            (
+                " span{path=other::module}".to_string(),
+                Color::DarkGrey,
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn message_parts_highlight_quoted_strings() {
+        let mut parts = Vec::new();
+        push_message_parts(&mut parts, "loaded \"user 42\" from cache", Color::White);
+
+        assert_eq!(parts[0], ("loaded ".to_string(), Color::White, false));
+        assert_eq!(parts[1], ("\"user 42\"".to_string(), string_color(), false));
+        assert_eq!(parts[2], (" from cache".to_string(), Color::White, false));
+    }
+
+    #[test]
+    fn message_parts_keep_escaped_quotes_inside_string() {
+        let mut parts = Vec::new();
+        push_message_parts(&mut parts, "loaded \"user \\\"jonas\\\"\"", Color::White);
+
+        assert_eq!(parts[0], ("loaded ".to_string(), Color::White, false));
+        assert_eq!(
+            parts[1],
+            ("\"user \\\"jonas\\\"\"".to_string(), string_color(), false)
+        );
+    }
+
+    #[test]
+    fn span_parts_use_span_specific_colors() {
+        let spans = vec![
+            "request{id=7}".to_string(),
+            "db{query=\"select\"}".to_string(),
+        ];
+        let mut parts = Vec::new();
+
+        push_span_parts(&mut parts, &spans);
+
+        assert_eq!(
+            parts[0],
+            ("request".to_string(), span_name_color("request"), false)
+        );
+        assert_eq!(parts[1], ("{".to_string(), span_punctuation_color(), false));
+        assert_eq!(parts[2], ("id".to_string(), span_key_color(), false));
+        assert_eq!(parts[3], ("=".to_string(), span_punctuation_color(), false));
+        assert_eq!(parts[4], ("7".to_string(), span_value_color("7"), false));
+        assert_eq!(parts[6], (": ".to_string(), Color::DarkGrey, false));
+        assert_eq!(parts[7], ("db".to_string(), span_name_color("db"), false));
+        assert_eq!(
+            parts[10],
+            ("=".to_string(), span_punctuation_color(), false)
+        );
+        assert_eq!(parts[11], ("\"select\"".to_string(), string_color(), false));
+    }
+
+    #[test]
+    fn span_parts_render_bare_spans_as_span_names() {
+        let spans = vec!["load_graphs".to_string(), "load_graphs_inner".to_string()];
+        let mut parts = Vec::new();
+
+        push_span_parts(&mut parts, &spans);
+
+        assert_eq!(
+            parts[0],
+            (
+                "load_graphs".to_string(),
+                span_name_color("load_graphs"),
+                false
+            )
+        );
+        assert_eq!(parts[1], (": ".to_string(), Color::DarkGrey, false));
+        assert_eq!(
+            parts[2],
+            (
+                "load_graphs_inner".to_string(),
+                span_name_color("load_graphs_inner"),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn span_palette_is_separate_from_target_palette() {
+        assert_eq!(SPAN_PALETTE_SIZE, 64);
+        assert_ne!(span_name_color("request"), target_module_color("request"));
+    }
+}

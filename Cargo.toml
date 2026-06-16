@@ -1,0 +1,25 @@
+[package]
+name = "traceview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Run a command and inspect its logs in a scrollable terminal viewer"
+readme = "README.md"
+repository = "https://github.com/ctron/traceview"
+homepage = "https://github.com/ctron/traceview"
+license = "Apache-2.0"
+keywords = ["cli", "logs", "terminal", "viewer", "trace"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+[dependencies]
+anyhow = "1.0.102"
+base64 = "0.22.1"
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+
+[dev-dependencies]
+rstest = "0.26.1"
+
+[[bin]]
+name = "tv"
+path = "src/main.rs"
