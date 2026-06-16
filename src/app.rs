@@ -75,7 +75,7 @@ fn event_loop(
                         timestamp: None,
                         level: Level::Error,
                         parsed: false,
-                        target: Some("traceview".to_string()),
+                        target: Some("traceviewer".to_string()),
                         spans: Vec::new(),
                         message,
                         stream,

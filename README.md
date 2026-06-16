@@ -1,9 +1,9 @@
-# traceview
+# traceviewer
 
 [![CI](https://github.com/ctron/traceview/actions/workflows/ci.yml/badge.svg)](https://github.com/ctron/traceview/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/traceview.svg)](https://crates.io/crates/traceview)
+[![crates.io](https://img.shields.io/crates/v/traceviewer.svg)](https://crates.io/crates/traceviewer)
 
-`traceview` runs a command and shows its output in a scrollable terminal log
+`traceviewer` runs a command and shows its output in a scrollable terminal log
 viewer.
 
 It is useful for inspecting long-running command output while keeping recent
@@ -12,7 +12,7 @@ log lines selectable, searchable by eye, and copyable from inside the terminal.
 ## Install
 
 ```sh
-cargo install traceview
+cargo install traceviewer
 ```
 
 The installed binary is named `tv`.
@@ -25,7 +25,7 @@ tv --format tracing -- my-service
 tv --max-lines 5000 -- ./run.sh
 ```
 
-By default, `traceview` attempts to recognize common `env_logger` and
+By default, `traceviewer` attempts to recognize common `env_logger` and
 `tracing` text output. Use `--format plain`, `--format env-logger`, or
 `--format tracing` to choose a parser explicitly.
 

@@ -621,7 +621,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "traceview"
+name = "traceviewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
