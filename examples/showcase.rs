@@ -1,0 +1,224 @@
+use std::{env, io};
+
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_subscriber::{filter::LevelFilter, prelude::*, registry::Registry};
+
+#[derive(Clone, Copy)]
+enum Format {
+    Plain,
+    EnvLogger,
+    Tracing,
+    Bunyan,
+}
+
+impl Format {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "plain" => Some(Self::Plain),
+            "env-logger" | "env_logger" => Some(Self::EnvLogger),
+            "tracing" => Some(Self::Tracing),
+            "bunyan" => Some(Self::Bunyan),
+            _ => None,
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_help();
+        return;
+    }
+
+    let Some(format) = args.first().and_then(|arg| Format::parse(arg)) else {
+        print_help();
+        return;
+    };
+
+    let repeat = option_usize(&args, "--repeat").unwrap_or(1);
+    match format {
+        Format::Plain => emit_plain(repeat),
+        Format::EnvLogger => {
+            init_env_logger();
+            emit_log_records(repeat);
+        }
+        Format::Tracing => {
+            init_tracing_fmt();
+            emit_tracing_records(repeat);
+        }
+        Format::Bunyan => {
+            init_bunyan();
+            emit_tracing_records(repeat);
+        }
+    }
+}
+
+fn option_usize(args: &[String], name: &str) -> Option<usize> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .and_then(|window| window[1].parse().ok())
+}
+
+fn init_env_logger() {
+    let mut builder = env_logger::Builder::new();
+    builder
+        .filter_level(log::LevelFilter::Trace)
+        .format_timestamp_secs()
+        .target(env_logger::Target::Stdout)
+        .init();
+}
+
+fn init_tracing_fmt() {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_target(true)
+        .init();
+}
+
+fn init_bunyan() {
+    let formatting_layer = BunyanFormattingLayer::new("showcase".to_string(), io::stdout);
+    let subscriber = Registry::default()
+        .with(LevelFilter::TRACE)
+        .with(JsonStorageLayer)
+        .with(formatting_layer);
+
+    tracing::subscriber::set_global_default(subscriber).expect("install tracing subscriber");
+}
+
+fn emit_plain(repeat: usize) {
+    for pass in 0..repeat {
+        println!("plain: booting demo service pass={}", pass + 1);
+        println!("plain: loaded 4 workers from ./config/showcase.toml");
+        eprintln!("plain: warning: retry budget is low");
+        println!("plain: completed request /api/widgets in 18ms");
+    }
+}
+
+fn emit_log_records(repeat: usize) {
+    for pass in 0..repeat {
+        log::info!(
+            target: "showcase::server",
+            "listening on {} pass={}",
+            "127.0.0.1:8080",
+            pass + 1
+        );
+
+        log::debug!(
+            target: "showcase::db",
+            "pool checkout took {}ms rows={}",
+            7,
+            12
+        );
+
+        log::warn!(
+            target: "showcase::client",
+            "upstream returned {}; retrying attempt={} retry_after_ms={}",
+            429,
+            2,
+            250
+        );
+
+        log::error!(
+            target: "showcase::worker",
+            "job failed: {} job_id={}",
+            "missing artifact",
+            "019b9370-0a9d-7231-825b-3f6f3b80555a"
+        );
+    }
+}
+
+fn emit_tracing_records(repeat: usize) {
+    for pass in 0..repeat {
+        tracing::info!(
+            target: "showcase::server",
+            addr = "127.0.0.1:8080",
+            workers = 4,
+            pass = pass + 1,
+            cold_start = pass == 0,
+            build.version = "0.1.2",
+            features = ?["plain", "env-logger", "tracing", "bunyan"],
+            "starting http listener"
+        );
+
+        let request = tracing::info_span!(
+            target: "showcase::handler",
+            "request",
+            id = 7,
+            method = "GET",
+            path = "/api/widgets"
+        );
+        let _request = request.enter();
+
+        tracing::debug!(
+            target: "showcase::handler",
+            count = 12,
+            cached = false,
+            user_id = 42,
+            latency_ms = 18.4,
+            "loaded widgets"
+        );
+
+        {
+            let db = tracing::trace_span!(target: "showcase::db", "db", pool = "primary");
+            let _db = db.enter();
+            tracing::trace!(
+                target: "showcase::db",
+                rows = 12,
+                elapsed_ms = 4.8,
+                "SELECT returned"
+            );
+        }
+
+        {
+            let upstream = tracing::warn_span!(
+                target: "showcase::client",
+                "upstream_call",
+                service = "inventory",
+                endpoint = "/v1/widgets"
+            );
+            let _upstream = upstream.enter();
+            tracing::warn!(
+                target: "showcase::client",
+                attempt = 2,
+                reason = "rate limited",
+                retry_after_ms = 250,
+                "retrying upstream"
+            );
+        }
+
+        {
+            let job = tracing::error_span!(
+                target: "showcase::worker",
+                "process_job",
+                job_id = "019b9370-0a9d-7231-825b-3f6f3b80555a",
+                queue = "imports"
+            );
+            let _job = job.enter();
+            tracing::error!(
+                target: "showcase::worker",
+                error = "missing artifact",
+                error.sources = ?["cache miss", "upstream timeout"],
+                "failed to process job"
+            );
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "\
+traceviewer showcase example
+
+Usage:
+  cargo run --example showcase -- <plain|env-logger|tracing|bunyan> [--repeat N]
+
+Examples:
+  cargo run --example showcase -- tracing
+  cargo run --example showcase -- bunyan
+  cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing
+  cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
+  cargo run --bin tv -- --format env-logger -- cargo run --example showcase -- env-logger
+"
+    );
+}
