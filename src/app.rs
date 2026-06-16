@@ -16,7 +16,7 @@ use crate::{
     parser::parse_log_line,
     process::{RunningCommand, spawn_command},
     terminal::TerminalGuard,
-    ui::{KeyAction, ViewState, draw, handle_key, selected_line_text},
+    ui::{KeyAction, ViewState, content_rows, draw, handle_key, selected_line_text},
 };
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
@@ -46,7 +46,7 @@ fn event_loop(
     let mut dirty = true;
 
     loop {
-        let page_size = terminal::size()?.1.saturating_sub(1) as usize;
+        let page_size = content_rows(terminal::size()?.1, &state);
 
         while let Ok(app_event) = command.events.try_recv() {
             match app_event {

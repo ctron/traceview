@@ -62,22 +62,6 @@ cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracin
 cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
 ```
 
-## Controls
-
-```text
-Up / Down       move cursor one line
-PgUp / PgDown   move cursor one page
-Home / End      jump to first or last retained line
-Left / Right    scroll horizontally
-f               focus selected target, or clear focus
-s               toggle span information
-r               toggle raw log line display
-y               copy selected line to clipboard
-?               toggle help
-q / Esc         exit after the process ends
-Ctrl-C          kill process and exit
-```
-
 ## License
 
 This project is licensed under the terms in `LICENSE`.

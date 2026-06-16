@@ -22,6 +22,9 @@ pub(crate) struct ViewState {
     pub(crate) help_visible: bool,
     pub(crate) show_spans: bool,
     pub(crate) show_raw: bool,
+    pub(crate) search_query: String,
+    pub(crate) search_editing: bool,
+    pub(crate) search_wrapped: bool,
     pub(crate) focus_target: Option<String>,
 }
 
@@ -122,23 +125,92 @@ pub(crate) fn handle_key(
     process_exited: bool,
     page_size: usize,
 ) -> KeyAction {
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyAction::Quit;
+    }
+
+    if state.search_editing {
+        return handle_search_key(key, entries, state, page_size);
+    }
+
+    if state.help_visible {
+        return handle_help_key(key, state);
+    }
+
+    handle_normal_key(key, entries, state, process_exited, page_size)
+}
+
+fn handle_search_key(
+    key: KeyEvent,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    page_size: usize,
+) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => {
+            clear_search(state);
+        }
+        KeyCode::Enter => {
+            state.search_editing = false;
+            state.search_wrapped = false;
+            jump_to_search_match(entries, state, page_size, SearchDirection::Next);
+        }
+        KeyCode::Backspace => {
+            state.search_query.pop();
+            state.search_wrapped = false;
+            jump_to_search_match(entries, state, page_size, SearchDirection::CurrentOrNext);
+        }
+        KeyCode::Char(ch) => {
+            state.search_query.push(ch);
+            state.search_wrapped = false;
+            jump_to_search_match(entries, state, page_size, SearchDirection::CurrentOrNext);
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn handle_help_key(key: KeyEvent, state: &mut ViewState) -> KeyAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            state.help_visible = false;
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn handle_normal_key(
+    key: KeyEvent,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    process_exited: bool,
+    page_size: usize,
+) -> KeyAction {
     let visible = visible_indices(entries, state);
     let page_step = cmp::max(1, page_size.saturating_sub(1));
     const HORIZONTAL_SCROLL_STEP: usize = 16;
 
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return KeyAction::Quit;
-        }
         KeyCode::Char('?') => {
             state.help_visible = !state.help_visible;
             return KeyAction::Continue;
         }
-        KeyCode::Esc | KeyCode::Char('q') if state.help_visible => {
-            state.help_visible = false;
+        KeyCode::Char('/') => {
+            state.search_editing = true;
+            state.search_wrapped = false;
             return KeyAction::Continue;
         }
-        _ if state.help_visible => return KeyAction::Continue,
+        KeyCode::Char('n') => {
+            jump_to_search_match(entries, state, page_size, SearchDirection::Next);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('b') => {
+            jump_to_search_match(entries, state, page_size, SearchDirection::Previous);
+            return KeyAction::Continue;
+        }
         KeyCode::Char('s') => {
             state.show_spans = !state.show_spans;
             return KeyAction::Continue;
@@ -160,7 +232,11 @@ pub(crate) fn handle_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('y') => return KeyAction::CopySelected,
-        KeyCode::Char('q') | KeyCode::Esc => {
+        KeyCode::Esc if !state.search_query.is_empty() => {
+            clear_search(state);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('q') => {
             if process_exited {
                 return KeyAction::Quit;
             }
@@ -185,6 +261,12 @@ pub(crate) fn handle_key(
     KeyAction::Continue
 }
 
+fn clear_search(state: &mut ViewState) {
+    state.search_query.clear();
+    state.search_editing = false;
+    state.search_wrapped = false;
+}
+
 pub(crate) fn draw(
     stdout: &mut impl Write,
     entries: &VecDeque<LogEntry>,
@@ -192,7 +274,7 @@ pub(crate) fn draw(
     exit_status: Option<ExitStatus>,
 ) -> Result<()> {
     let (cols, rows) = terminal::size()?;
-    let content_rows = rows.saturating_sub(1) as usize;
+    let content_rows = content_rows(rows, state);
     if state.help_visible {
         queue!(stdout, Hide, Clear(ClearType::All))?;
         draw_help_page(stdout, cols, content_rows)?;
@@ -200,12 +282,16 @@ pub(crate) fn draw(
         queue!(
             stdout,
             MoveTo(0, rows.saturating_sub(1)),
-            PrintStyledContent(status.reverse())
+            SetForegroundColor(status_bar_foreground()),
+            SetBackgroundColor(status_bar_background()),
+            Print(status),
+            ResetColor
         )?;
         stdout.flush()?;
         return Ok(());
     }
 
+    let top_bar_rows = usize::from(search_bar_visible(state));
     let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
     let log_width = (cols as usize).saturating_sub(scrollbar_width);
     let visible = visible_indices(entries, state);
@@ -226,11 +312,15 @@ pub(crate) fn draw(
 
     queue!(stdout, Hide, Clear(ClearType::All))?;
 
+    if search_bar_visible(state) {
+        draw_search_bar(stdout, entries, state, cols as usize)?;
+    }
+
     for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
         let Some(entry) = entries.get(idx) else {
             continue;
         };
-        queue!(stdout, MoveTo(0, screen_row as u16))?;
+        queue!(stdout, MoveTo(0, (screen_row + top_bar_rows) as u16))?;
         EntryRenderer::from(state).draw(
             stdout,
             entry,
@@ -245,10 +335,13 @@ pub(crate) fn draw(
             stdout,
             entries,
             &visible,
-            start_pos,
-            end_pos,
-            content_rows,
-            cols.saturating_sub(1),
+            ScrollbarViewport {
+                visible_start: start_pos,
+                visible_end: end_pos,
+                height: content_rows,
+                top_row: top_bar_rows,
+                column: cols.saturating_sub(1),
+            },
         )?;
     }
 
@@ -256,24 +349,119 @@ pub(crate) fn draw(
     queue!(
         stdout,
         MoveTo(0, rows.saturating_sub(1)),
-        PrintStyledContent(status.reverse())
+        SetForegroundColor(status_bar_foreground()),
+        SetBackgroundColor(status_bar_background()),
+        Print(status),
+        ResetColor
     )?;
     stdout.flush()?;
     Ok(())
+}
+
+pub(crate) fn content_rows(rows: u16, state: &ViewState) -> usize {
+    rows.saturating_sub(1 + u16::from(search_bar_visible(state))) as usize
+}
+
+fn search_bar_visible(state: &ViewState) -> bool {
+    state.search_editing || !state.search_query.is_empty()
+}
+
+fn draw_search_bar(
+    stdout: &mut impl Write,
+    entries: &VecDeque<LogEntry>,
+    state: &ViewState,
+    width: usize,
+) -> Result<()> {
+    let matches = search_match_indices(entries, state);
+    let results = search_result_summary(&matches, state.selected, state.search_wrapped);
+    let (prompt, cursor, help) = if state.search_editing {
+        ("Search(*)", "_", "Enter accept  Esc clear")
+    } else {
+        ("Search", "", "/ edit  Esc clear")
+    };
+    let bar = format!(
+        " {prompt}: {}{cursor}  {help}  n next  b previous  {results} ",
+        state.search_query
+    );
+    let (foreground, background) = search_bar_colors(state.search_editing);
+    queue!(
+        stdout,
+        MoveTo(0, 0),
+        SetForegroundColor(foreground),
+        SetBackgroundColor(background),
+        Print(visible_slice(&format!("{bar:<width$}"), 0, width)),
+        ResetColor
+    )?;
+    Ok(())
+}
+
+fn search_bar_colors(editing: bool) -> (Color, Color) {
+    if editing {
+        (
+            Color::Black,
+            Color::Rgb {
+                r: 150,
+                g: 205,
+                b: 255,
+            },
+        )
+    } else {
+        (Color::Black, Color::White)
+    }
+}
+
+fn status_bar_foreground() -> Color {
+    Color::Black
+}
+
+fn status_bar_background() -> Color {
+    Color::White
+}
+
+fn search_result_summary(matches: &[usize], selected: Option<usize>, wrapped: bool) -> String {
+    if matches.is_empty() {
+        return "0 results".to_string();
+    }
+
+    let label = result_count_label(matches.len());
+    let Some(position) =
+        selected.and_then(|selected| matches.iter().position(|idx| *idx == selected))
+    else {
+        return label;
+    };
+
+    let result_number = position + 1;
+    let note = if wrapped { "  wrapped" } else { "" };
+
+    format!("{label}  {result_number}/{}{note}", matches.len())
+}
+
+fn result_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 result".to_string()
+    } else {
+        format!("{count} results")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarViewport {
+    visible_start: usize,
+    visible_end: usize,
+    height: usize,
+    top_row: usize,
+    column: u16,
 }
 
 fn draw_scrollbar(
     stdout: &mut impl Write,
     entries: &VecDeque<LogEntry>,
     visible_indices: &[usize],
-    visible_start: usize,
-    visible_end: usize,
-    height: usize,
-    column: u16,
+    viewport: ScrollbarViewport,
 ) -> Result<()> {
-    for row in 0..height {
-        let slice = ScrollbarSlice::new(row, height, visible_indices.len());
-        let in_view = slice.start < visible_end && slice.end > visible_start;
+    for row in 0..viewport.height {
+        let slice = ScrollbarSlice::new(row, viewport.height, visible_indices.len());
+        let in_view = slice.start < viewport.visible_end && slice.end > viewport.visible_start;
         let color = scrollbar_slice_color(entries, visible_indices, slice.start, slice.end);
         let marker = if in_view { "#" } else { "|" };
         let mut styled = style(marker).with(color);
@@ -283,7 +471,7 @@ fn draw_scrollbar(
 
         queue!(
             stdout,
-            MoveTo(column, row as u16),
+            MoveTo(viewport.column, (row + viewport.top_row) as u16),
             PrintStyledContent(styled)
         )?;
     }
@@ -299,9 +487,12 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  r               toggle raw log line display",
+        "  /               search raw log lines",
+        "  n / b           jump to next or previous search result",
+        "  Esc             clear search, or close help",
         "  y               copy selected line to clipboard",
         "  ?               toggle this help page",
-        "  q / Esc         close help, or exit after the process ends",
+        "  q               exit after the process ends",
         "  Ctrl-C          kill process and exit",
         "",
         "Navigation",
@@ -358,9 +549,81 @@ fn selected_visible_pos(visible: &[usize], selected: Option<usize>) -> Option<us
 }
 
 #[derive(Clone, Copy, Debug)]
+enum SearchDirection {
+    CurrentOrNext,
+    Next,
+    Previous,
+}
+
+fn jump_to_search_match(
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    page_size: usize,
+    direction: SearchDirection,
+) {
+    let matches = search_match_indices(entries, state);
+    if matches.is_empty() {
+        return;
+    }
+
+    let selected = state.selected;
+    let (next, wrapped) = match direction {
+        SearchDirection::CurrentOrNext => (
+            matches
+                .iter()
+                .copied()
+                .find(|idx| Some(*idx) == selected)
+                .or_else(|| next_match_after(&matches, selected))
+                .unwrap_or(matches[0]),
+            false,
+        ),
+        SearchDirection::Next => match next_match_after(&matches, selected) {
+            Some(next) => (next, false),
+            None => (matches[0], selected.is_some()),
+        },
+        SearchDirection::Previous => match previous_match_before(&matches, selected) {
+            Some(previous) => (previous, false),
+            None => (
+                matches
+                    .last()
+                    .copied()
+                    .expect("matches is known to be non-empty"),
+                selected.is_some(),
+            ),
+        },
+    };
+
+    state.search_wrapped = wrapped;
+    state.selected = Some(next);
+    state.scroll_selected_into_view(entries, page_size);
+}
+
+fn next_match_after(matches: &[usize], selected: Option<usize>) -> Option<usize> {
+    let selected = selected?;
+    matches.iter().copied().find(|idx| *idx > selected)
+}
+
+fn previous_match_before(matches: &[usize], selected: Option<usize>) -> Option<usize> {
+    let selected = selected?;
+    matches.iter().rev().copied().find(|idx| *idx < selected)
+}
+
+fn search_match_indices(entries: &VecDeque<LogEntry>, state: &ViewState) -> Vec<usize> {
+    if state.search_query.is_empty() {
+        return Vec::new();
+    }
+
+    visible_indices(entries, state)
+        .into_iter()
+        .filter(|idx| entries[*idx].raw.contains(&state.search_query))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
 struct RenderOptions {
     show_spans: bool,
     show_raw: bool,
+    search_query: String,
 }
 
 impl From<&ViewState> for RenderOptions {
@@ -368,15 +631,17 @@ impl From<&ViewState> for RenderOptions {
         Self {
             show_spans: state.show_spans,
             show_raw: state.show_raw,
+            search_query: state.search_query.clone(),
         }
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Part {
     text: String,
     color: Color,
     bold: bool,
+    highlighted: bool,
 }
 
 impl Part {
@@ -385,11 +650,75 @@ impl Part {
             text: text.into(),
             color,
             bold,
+            highlighted: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+fn apply_search_highlights(parts: Vec<Part>, query: &str) -> Vec<Part> {
+    if query.is_empty() {
+        return parts;
+    }
+
+    let text = EntryRenderer::plain_text_from_parts(&parts);
+    let ranges: Vec<_> = text
+        .match_indices(query)
+        .map(|(idx, found)| {
+            let start = text[..idx].chars().count();
+            let end = start + found.chars().count();
+            (start, end)
+        })
+        .collect();
+    if ranges.is_empty() {
+        return parts;
+    }
+
+    let mut highlighted = Vec::new();
+    let mut cursor = 0usize;
+
+    for part in parts {
+        let part_len = part.text.chars().count();
+        let part_start = cursor;
+        let part_end = part_start + part_len;
+        cursor = part_end;
+
+        let mut local_start = 0usize;
+        while local_start < part_len {
+            let absolute = part_start + local_start;
+            let is_highlighted = ranges
+                .iter()
+                .any(|(start, end)| absolute >= *start && absolute < *end);
+            let local_end = (local_start + 1..=part_len)
+                .find(|candidate| {
+                    let absolute = part_start + *candidate;
+                    let candidate_highlighted = ranges
+                        .iter()
+                        .any(|(start, end)| absolute >= *start && absolute < *end);
+                    candidate_highlighted != is_highlighted
+                })
+                .unwrap_or(part_len);
+
+            let text: String = part
+                .text
+                .chars()
+                .skip(local_start)
+                .take(local_end - local_start)
+                .collect();
+            let segment = Part {
+                text,
+                color: part.color,
+                bold: part.bold,
+                highlighted: part.highlighted || is_highlighted,
+            };
+            highlighted.push(segment);
+            local_start = local_end;
+        }
+    }
+
+    highlighted
+}
+
+#[derive(Clone, Debug)]
 struct EntryRenderer {
     options: RenderOptions,
 }
@@ -422,7 +751,14 @@ impl EntryRenderer {
         let mut cursor = 0usize;
 
         if viewport.show_left_marker {
-            print_segment(stdout, "<".to_string(), Color::DarkGrey, true, selected)?;
+            print_segment(
+                stdout,
+                "<".to_string(),
+                Color::DarkGrey,
+                true,
+                false,
+                selected,
+            )?;
         }
 
         for part in parts {
@@ -444,16 +780,37 @@ impl EntryRenderer {
                 .skip(local_start)
                 .take(local_len)
                 .collect();
-            print_segment(stdout, segment, part.color, part.bold, selected)?;
+            print_segment(
+                stdout,
+                segment,
+                part.color,
+                part.bold,
+                part.highlighted,
+                selected,
+            )?;
         }
 
         let remaining = content_width.saturating_sub(visible.chars().count());
         if remaining > 0 {
-            print_segment(stdout, " ".repeat(remaining), Color::White, false, selected)?;
+            print_segment(
+                stdout,
+                " ".repeat(remaining),
+                Color::White,
+                false,
+                false,
+                selected,
+            )?;
         }
 
         if viewport.show_right_marker {
-            print_segment(stdout, ">".to_string(), Color::DarkGrey, true, selected)?;
+            print_segment(
+                stdout,
+                ">".to_string(),
+                Color::DarkGrey,
+                true,
+                false,
+                selected,
+            )?;
         }
 
         if selected {
@@ -462,7 +819,7 @@ impl EntryRenderer {
         Ok(())
     }
 
-    fn plain_text(self, entry: &LogEntry) -> String {
+    fn plain_text(&self, entry: &LogEntry) -> String {
         Self::plain_text_from_parts(&self.parts(entry))
     }
 
@@ -470,7 +827,7 @@ impl EntryRenderer {
         parts.iter().map(|part| part.text.as_str()).collect()
     }
 
-    fn parts(self, entry: &LogEntry) -> Vec<Part> {
+    fn parts(&self, entry: &LogEntry) -> Vec<Part> {
         let mut parts = Vec::new();
         parts.push(Part::new(
             format!("{} ", entry.stream.indicator()),
@@ -479,7 +836,7 @@ impl EntryRenderer {
         ));
         if self.options.show_raw {
             parts.push(Part::new(&entry.raw, message_color(entry), false));
-            return parts;
+            return apply_search_highlights(parts, self.search_highlight_query(entry));
         }
         if let Some(timestamp) = &entry.timestamp {
             parts.push(Part::new(format!("{timestamp} "), Color::DarkGrey, false));
@@ -503,10 +860,18 @@ impl EntryRenderer {
             &entry.message_parts,
             message_color(entry),
         );
-        parts
+        apply_search_highlights(parts, self.search_highlight_query(entry))
     }
 
-    fn push_target_parts(self, parts: &mut Vec<Part>, target: &str) {
+    fn search_highlight_query<'a>(&'a self, entry: &LogEntry) -> &'a str {
+        if !self.options.search_query.is_empty() && entry.raw.contains(&self.options.search_query) {
+            &self.options.search_query
+        } else {
+            ""
+        }
+    }
+
+    fn push_target_parts(&self, parts: &mut Vec<Part>, target: &str) {
         let split_at = target
             .char_indices()
             .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
@@ -526,14 +891,14 @@ impl EntryRenderer {
         parts.push(Part::new(": ", Color::DarkGrey, false));
     }
 
-    fn push_span_parts(self, parts: &mut Vec<Part>, spans: &[String]) {
+    fn push_span_parts(&self, parts: &mut Vec<Part>, spans: &[String]) {
         for span in spans {
             self.push_span_part(parts, span);
             parts.push(Part::new(": ", Color::DarkGrey, false));
         }
     }
 
-    fn push_span_part(self, parts: &mut Vec<Part>, span: &str) {
+    fn push_span_part(&self, parts: &mut Vec<Part>, span: &str) {
         if let Some(open) = span.find('{') {
             let (name, fields) = span.split_at(open);
             parts.push(Part::new(name, span_name_color(name), false));
@@ -543,7 +908,7 @@ impl EntryRenderer {
         }
     }
 
-    fn push_span_fields(self, parts: &mut Vec<Part>, fields: &str) {
+    fn push_span_fields(&self, parts: &mut Vec<Part>, fields: &str) {
         let mut current = String::new();
         let mut token = String::new();
         let mut chars = fields.chars().peekable();
@@ -626,7 +991,7 @@ fn flush_span_token(
 
 impl EntryRenderer {
     fn push_message_parts(
-        self,
+        &self,
         parts: &mut Vec<Part>,
         message: &str,
         message_parts: &[MessagePart],
@@ -736,9 +1101,23 @@ fn print_segment(
     text: String,
     color: Color,
     bold: bool,
+    highlighted: bool,
     selected: bool,
 ) -> Result<()> {
-    if selected {
+    if highlighted {
+        queue!(
+            stdout,
+            SetBackgroundColor(search_match_background()),
+            SetForegroundColor(search_match_foreground())
+        )?;
+        if bold {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print(text), ResetColor)?;
+        if bold {
+            queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+        }
+    } else if selected {
         queue!(
             stdout,
             SetBackgroundColor(selected_background()),
@@ -772,6 +1151,14 @@ fn selected_background() -> Color {
         g: 64,
         b: 64,
     }
+}
+
+fn search_match_background() -> Color {
+    Color::Yellow
+}
+
+fn search_match_foreground() -> Color {
+    Color::Black
 }
 
 fn selected_foreground(color: Color) -> Color {
@@ -808,15 +1195,30 @@ fn status_line(
         .as_deref()
         .map(|target| focus_status(entries, target))
         .unwrap_or_default();
+    let search = search_status(entries, state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {}{focus} | ? help ",
+        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {}{focus}{search} | ? help ",
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
+}
+
+fn search_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
+    if state.search_query.is_empty() && !state.search_editing {
+        return String::new();
+    }
+
+    let matches = search_match_indices(entries, state).len();
+    let prefix = if state.search_editing {
+        "search /"
+    } else {
+        "search "
+    };
+    format!(" | {prefix}{} ({matches} results)", state.search_query)
 }
 
 fn focus_status(entries: &VecDeque<LogEntry>, target: &str) -> String {
@@ -1061,6 +1463,7 @@ mod tests {
             options: RenderOptions {
                 show_spans: true,
                 show_raw: false,
+                search_query: String::new(),
             },
         }
     }
@@ -1161,6 +1564,355 @@ mod tests {
 
         handle_key(key(KeyCode::Char('r')), &entries, &mut state, false, 5);
         assert!(!state.show_raw);
+    }
+
+    #[test]
+    fn slash_starts_raw_search_and_typing_updates_matches() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "apple"),
+            entry_with_target(Some("beta"), "berry"),
+            entry_with_target(Some("gamma"), "cherry"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(0),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
+        assert!(state.search_editing);
+        assert_eq!(state.search_query, "");
+
+        handle_key(key(KeyCode::Char('e')), &entries, &mut state, false, 5);
+        assert_eq!(state.search_query, "e");
+        assert_eq!(state.selected, Some(0));
+
+        handle_key(key(KeyCode::Char('r')), &entries, &mut state, false, 5);
+        assert_eq!(state.search_query, "er");
+        assert_eq!(state.selected, Some(1));
+        assert_eq!(search_match_indices(&entries, &state), vec![1, 2]);
+
+        let status = status_line(&entries, &state, None, 120);
+        assert!(status.contains("search /er (2 results)"));
+    }
+
+    #[test]
+    fn search_bar_shows_input_state_and_result_count() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "miss"),
+            entry_with_target(Some("beta"), "hit one"),
+            entry_with_target(Some("gamma"), "hit two"),
+        ]);
+        let state = ViewState {
+            search_editing: true,
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+        let mut output = Vec::new();
+
+        draw_search_bar(&mut output, &entries, &state, 100).expect("draw search bar");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("Search(*): hit_"));
+        assert!(text.contains("2 results"));
+        assert!(text.contains("Enter accept"));
+        assert!(text.contains("Esc clear"));
+        assert!(text.contains("n next"));
+        assert!(text.contains("b previous"));
+        assert!(text.find("Enter accept").unwrap() < text.find("2 results").unwrap());
+    }
+
+    #[test]
+    fn search_bar_colors_distinguish_editing_from_locked() {
+        assert_eq!(
+            search_bar_colors(true),
+            (
+                Color::Black,
+                Color::Rgb {
+                    r: 150,
+                    g: 205,
+                    b: 255
+                }
+            )
+        );
+        assert_eq!(search_bar_colors(false), (Color::Black, Color::White));
+    }
+
+    #[test]
+    fn status_bar_uses_high_contrast_neutral_tone() {
+        assert_eq!(status_bar_foreground(), Color::Black);
+        assert_eq!(status_bar_background(), Color::White);
+    }
+
+    #[test]
+    fn locked_search_bar_only_shows_normal_mode_shortcuts() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "miss"),
+            entry_with_target(Some("beta"), "hit one"),
+        ]);
+        let state = ViewState {
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+        let mut output = Vec::new();
+
+        draw_search_bar(&mut output, &entries, &state, 100).expect("draw search bar");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("Search: hit"));
+        assert!(text.contains("/ edit"));
+        assert!(text.contains("n next"));
+        assert!(text.contains("b previous"));
+        assert!(text.contains("Esc clear"));
+        assert!(!text.contains("Enter accept"));
+        assert!(text.find("/ edit").unwrap() < text.find("1 result").unwrap());
+    }
+
+    #[test]
+    fn search_bar_does_not_predict_wraps_at_first_or_last_result() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "hit one"),
+            entry_with_target(Some("beta"), "miss"),
+            entry_with_target(Some("gamma"), "hit two"),
+        ]);
+
+        let first = ViewState {
+            selected: Some(0),
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+        let mut first_output = Vec::new();
+        draw_search_bar(&mut first_output, &entries, &first, 120).expect("draw search bar");
+        let first_text = String::from_utf8(first_output).expect("utf8");
+        assert!(first_text.contains("2 results  1/2"));
+        assert!(!first_text.contains("wrap"));
+
+        let last = ViewState {
+            selected: Some(2),
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+        let mut last_output = Vec::new();
+        draw_search_bar(&mut last_output, &entries, &last, 120).expect("draw search bar");
+        let last_text = String::from_utf8(last_output).expect("utf8");
+        assert!(last_text.contains("2 results  2/2"));
+        assert!(!last_text.contains("wrap"));
+    }
+
+    #[test]
+    fn search_bar_shows_wrapped_after_actual_wrap() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "hit one"),
+            entry_with_target(Some("beta"), "miss"),
+            entry_with_target(Some("gamma"), "hit two"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(2),
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(0));
+        assert!(state.search_wrapped);
+
+        let mut output = Vec::new();
+        draw_search_bar(&mut output, &entries, &state, 120).expect("draw search bar");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("2 results  1/2  wrapped"));
+    }
+
+    #[test]
+    fn search_bar_does_not_note_single_result_until_wrap_happens() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "miss"),
+            entry_with_target(Some("beta"), "hit one"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(1),
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+        let mut output = Vec::new();
+
+        draw_search_bar(&mut output, &entries, &state, 120).expect("draw search bar");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("1 result  1/1"));
+        assert!(!text.contains("wrapped"));
+
+        handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
+        let mut wrapped_output = Vec::new();
+        draw_search_bar(&mut wrapped_output, &entries, &state, 120).expect("draw search bar");
+        let wrapped_text = String::from_utf8(wrapped_output).expect("utf8");
+
+        assert!(wrapped_text.contains("1 result  1/1  wrapped"));
+    }
+
+    #[test]
+    fn search_bar_reduces_log_content_rows() {
+        let inactive = ViewState::new();
+        let active = ViewState {
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+
+        assert_eq!(content_rows(10, &inactive), 9);
+        assert_eq!(content_rows(10, &active), 8);
+    }
+
+    #[test]
+    fn enter_finishes_search_input_and_escape_clears_search() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "apple"),
+            entry_with_target(Some("beta"), "berry"),
+        ]);
+        let mut state = ViewState::new();
+
+        handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Char('b')), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Enter), &entries, &mut state, false, 5);
+
+        assert!(!state.search_editing);
+        assert_eq!(state.search_query, "b");
+        assert_eq!(state.selected, Some(1));
+
+        handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Char('a')), &entries, &mut state, false, 5);
+        handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5);
+
+        assert!(!state.search_editing);
+        assert_eq!(state.search_query, "");
+    }
+
+    #[test]
+    fn slash_edits_existing_locked_search() {
+        let entries = VecDeque::from([entry_with_target(Some("alpha"), "apple")]);
+        let mut state = ViewState {
+            search_query: "app".to_string(),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
+        assert!(state.search_editing);
+        assert_eq!(state.search_query, "app");
+
+        handle_key(key(KeyCode::Char('l')), &entries, &mut state, false, 5);
+        assert_eq!(state.search_query, "appl");
+    }
+
+    #[test]
+    fn escape_clears_locked_search_without_quitting() {
+        let entries = VecDeque::from([entry_with_target(Some("alpha"), "apple")]);
+        let mut state = ViewState {
+            search_query: "apple".to_string(),
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Esc), &entries, &mut state, true, 5),
+            KeyAction::Continue
+        );
+        assert_eq!(state.search_query, "");
+        assert!(!state.search_editing);
+    }
+
+    #[test]
+    fn n_and_b_jump_between_search_results_with_wraparound() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "miss"),
+            entry_with_target(Some("beta"), "hit one"),
+            entry_with_target(Some("gamma"), "miss again"),
+            entry_with_target(Some("delta"), "hit two"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(0),
+            search_query: "hit".to_string(),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(1));
+        assert!(!state.search_wrapped);
+
+        handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(3));
+        assert!(!state.search_wrapped);
+
+        handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(1));
+        assert!(state.search_wrapped);
+
+        handle_key(key(KeyCode::Char('b')), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(3));
+        assert!(state.search_wrapped);
+    }
+
+    #[test]
+    fn search_uses_raw_line_not_rendered_message() {
+        let entries = VecDeque::from([LogEntry {
+            raw: "2026-06-15T12:01:02Z INFO svc: original raw text".to_string(),
+            timestamp: Some("2026-06-15T12:01:02Z".to_string()),
+            level: Level::Info,
+            parsed: true,
+            target: Some("svc".to_string()),
+            spans: Vec::new(),
+            message: "parsed message".to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        }]);
+        let state = ViewState {
+            search_query: "original raw".to_string(),
+            ..ViewState::new()
+        };
+
+        assert_eq!(search_match_indices(&entries, &state), vec![0]);
+    }
+
+    #[test]
+    fn raw_search_match_is_highlighted_in_raw_display() {
+        let entry = LogEntry {
+            raw: "2026-06-15T12:01:02Z INFO svc: original raw text".to_string(),
+            timestamp: Some("2026-06-15T12:01:02Z".to_string()),
+            level: Level::Info,
+            parsed: true,
+            target: Some("svc".to_string()),
+            spans: Vec::new(),
+            message: "parsed message".to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        };
+        let state = ViewState {
+            show_raw: true,
+            search_query: "original raw".to_string(),
+            ..ViewState::new()
+        };
+
+        let parts = EntryRenderer::from(&state).parts(&entry);
+        let highlighted_text: String = parts
+            .iter()
+            .filter(|part| part.highlighted)
+            .map(|part| part.text.as_str())
+            .collect();
+
+        assert!(highlighted_text.contains("original raw"));
+    }
+
+    #[test]
+    fn visible_search_match_is_highlighted_in_parsed_display() {
+        let entry = entry_with_target(Some("svc"), "loaded widgets");
+        let state = ViewState {
+            search_query: "widgets".to_string(),
+            ..ViewState::new()
+        };
+
+        let parts = EntryRenderer::from(&state).parts(&entry);
+
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.text == "widgets" && part.highlighted)
+        );
     }
 
     #[test]
