@@ -1,1 +1,0 @@
-const e=require("./lib/client"),r=require("./lib/connect"),i=require("./lib/store"),o=require("./lib/default-message-id-provider"),t=require("./lib/unique-message-id-provider");module.exports.connect=r,module.exports.MqttClient=e,module.exports.Client=e,module.exports.Store=i,module.exports.DefaultMessageIdProvider=o,module.exports.UniqueMessageIdProvider=t;
