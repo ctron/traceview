@@ -43,6 +43,25 @@ Use `--format` to choose one explicitly:
 - `env-logger`: common `env_logger` text output
 - `tracing`: common `tracing` text output
 
+## Showcase Example
+
+The repository includes a small example app that emits representative log lines
+for each supported parser:
+
+```sh
+cargo run --example showcase -- env-logger
+cargo run --example showcase -- tracing
+cargo run --example showcase -- bunyan
+```
+
+Run it through `tv` to inspect the rendering:
+
+```sh
+cargo run --bin tv -- --format env-logger -- cargo run --example showcase -- env-logger
+cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing
+cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
+```
+
 ## Controls
 
 ```text
@@ -52,6 +71,7 @@ Home / End      jump to first or last retained line
 Left / Right    scroll horizontally
 f               focus selected target, or clear focus
 s               toggle span information
+r               toggle raw log line display
 y               copy selected line to clipboard
 ?               toggle help
 q / Esc         exit after the process ends

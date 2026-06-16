@@ -51,6 +51,7 @@ impl Level {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogEntry {
+    pub(crate) raw: String,
     pub(crate) timestamp: Option<String>,
     pub(crate) level: Level,
     pub(crate) parsed: bool,

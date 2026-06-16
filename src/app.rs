@@ -72,6 +72,7 @@ fn event_loop(
                 AppEvent::ReaderFailed(stream, err) => {
                     let message = format!("{stream:?} reader failed: {err}");
                     entries.push_back(LogEntry {
+                        raw: message.clone(),
                         timestamp: None,
                         level: Level::Error,
                         parsed: false,

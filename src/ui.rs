@@ -21,6 +21,7 @@ pub(crate) struct ViewState {
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
     pub(crate) show_spans: bool,
+    pub(crate) show_raw: bool,
     pub(crate) focus_target: Option<String>,
 }
 
@@ -140,6 +141,10 @@ pub(crate) fn handle_key(
         _ if state.help_visible => return KeyAction::Continue,
         KeyCode::Char('s') => {
             state.show_spans = !state.show_spans;
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('r') => {
+            state.show_raw = !state.show_raw;
             return KeyAction::Continue;
         }
         KeyCode::Char('f') => {
@@ -290,20 +295,21 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
     let lines = [
         "tv help",
         "",
+        "Actions",
+        "  f               focus selected target, or clear focus",
+        "  s               toggle span information",
+        "  r               toggle raw log line display",
+        "  y               copy selected line to clipboard",
+        "  ?               toggle this help page",
+        "  q / Esc         close help, or exit after the process ends",
+        "  Ctrl-C          kill process and exit",
+        "",
         "Navigation",
         "  Up / Down       move cursor one line",
         "  PgUp / PgDown   move cursor one page",
         "  Home / Pos1     move cursor to first retained line",
         "  End             move cursor to last retained line",
         "  Left / Right    scroll horizontally",
-        "",
-        "Actions",
-        "  f               focus selected target, or clear focus",
-        "  s               toggle span information",
-        "  y               copy selected line to clipboard",
-        "  ?               toggle this help page",
-        "  q / Esc         close help, or exit after the process ends",
-        "  Ctrl-C          kill process and exit",
     ];
 
     for (row, line) in lines.iter().take(content_rows).enumerate() {
@@ -354,12 +360,14 @@ fn selected_visible_pos(visible: &[usize], selected: Option<usize>) -> Option<us
 #[derive(Clone, Copy, Debug)]
 struct RenderOptions {
     show_spans: bool,
+    show_raw: bool,
 }
 
 impl From<&ViewState> for RenderOptions {
     fn from(state: &ViewState) -> Self {
         Self {
             show_spans: state.show_spans,
+            show_raw: state.show_raw,
         }
     }
 }
@@ -469,6 +477,10 @@ impl EntryRenderer {
             stream_color(entry.stream),
             true,
         ));
+        if self.options.show_raw {
+            parts.push(Part::new(&entry.raw, message_color(entry), false));
+            return parts;
+        }
         if let Some(timestamp) = &entry.timestamp {
             parts.push(Part::new(format!("{timestamp} "), Color::DarkGrey, false));
         }
@@ -798,9 +810,10 @@ fn status_line(
         .unwrap_or_default();
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | spans {}{focus} | ? help ",
+        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {}{focus} | ? help ",
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
+        if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
@@ -998,6 +1011,7 @@ mod tests {
     fn entries(count: usize) -> VecDeque<LogEntry> {
         (0..count)
             .map(|idx| LogEntry {
+                raw: format!("raw line {idx}"),
                 timestamp: None,
                 level: Level::Info,
                 parsed: true,
@@ -1012,6 +1026,7 @@ mod tests {
 
     fn entry_with_level(level: Level) -> LogEntry {
         LogEntry {
+            raw: "raw line".to_string(),
             timestamp: None,
             level,
             parsed: true,
@@ -1025,6 +1040,7 @@ mod tests {
 
     fn entry_with_target(target: Option<&str>, message: &str) -> LogEntry {
         LogEntry {
+            raw: format!("raw {message}"),
             timestamp: None,
             level: Level::Info,
             parsed: true,
@@ -1042,7 +1058,10 @@ mod tests {
 
     fn renderer() -> EntryRenderer {
         EntryRenderer {
-            options: RenderOptions { show_spans: true },
+            options: RenderOptions {
+                show_spans: true,
+                show_raw: false,
+            },
         }
     }
 
@@ -1103,6 +1122,16 @@ mod tests {
     }
 
     #[test]
+    fn compact_help_page_shows_raw_toggle() {
+        let mut output = Vec::new();
+
+        draw_help_page(&mut output, 80, 6).expect("draw help");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("r               toggle raw log line display"));
+    }
+
+    #[test]
     fn s_toggles_span_information() {
         let entries = entries(1);
         let mut state = ViewState::new();
@@ -1116,6 +1145,22 @@ mod tests {
 
         handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5);
         assert!(state.show_spans);
+    }
+
+    #[test]
+    fn r_toggles_raw_log_line_display() {
+        let entries = entries(1);
+        let mut state = ViewState::new();
+
+        assert!(!state.show_raw);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('r')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(state.show_raw);
+
+        handle_key(key(KeyCode::Char('r')), &entries, &mut state, false, 5);
+        assert!(!state.show_raw);
     }
 
     #[test]
@@ -1237,6 +1282,8 @@ mod tests {
     #[test]
     fn selected_line_text_matches_rendered_plain_text() {
         let entries = VecDeque::from([LogEntry {
+            raw: "2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\""
+                .to_string(),
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
@@ -1260,6 +1307,8 @@ mod tests {
     #[test]
     fn selected_line_text_omits_spans_when_hidden() {
         let entries = VecDeque::from([LogEntry {
+            raw: "2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\""
+                .to_string(),
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
@@ -1278,6 +1327,32 @@ mod tests {
         assert_eq!(
             selected_line_text(&entries, &state).as_deref(),
             Some("| 2026-06-15T12:01:02Z INFO  my_crate::worker: loaded \"user\"")
+        );
+    }
+
+    #[test]
+    fn selected_line_text_uses_raw_line_when_enabled() {
+        let entries = VecDeque::from([LogEntry {
+            raw: "2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\""
+                .to_string(),
+            timestamp: Some("2026-06-15T12:01:02Z".to_string()),
+            level: Level::Info,
+            parsed: true,
+            target: Some("my_crate::worker".to_string()),
+            spans: vec!["request{id=7}".to_string()],
+            message: "loaded \"user\"".to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        }]);
+        let state = ViewState {
+            selected: Some(0),
+            show_raw: true,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| 2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\"")
         );
     }
 

@@ -19,6 +19,7 @@ pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> 
     };
 
     parsed.unwrap_or_else(|| LogEntry {
+        raw: raw.clone(),
         level: if stream == Stream::Stderr {
             Level::Warn
         } else {
@@ -97,6 +98,7 @@ fn parse_env_logger(raw: &str) -> Option<LogEntry> {
     };
 
     Some(LogEntry {
+        raw: raw.to_string(),
         timestamp,
         level,
         parsed: true,
@@ -120,15 +122,18 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
     };
 
     let (target, spans, message) = split_tracing_target_message(rest);
+    let message_parts = tracing_message_parts(&message);
+    let message = MessagePart::plain_text(&message_parts);
 
     Some(LogEntry {
+        raw: raw.to_string(),
         timestamp,
         level,
         parsed: true,
         target,
         spans,
         message,
-        message_parts: Vec::new(),
+        message_parts,
         stream: Stream::Stdout,
     })
 }
@@ -154,6 +159,7 @@ fn parse_bunyan(raw: &str, stream: Stream) -> Option<LogEntry> {
     let message = MessagePart::plain_text(&message_parts);
 
     Some(LogEntry {
+        raw: raw.to_string(),
         timestamp,
         level,
         parsed: true,
@@ -202,6 +208,204 @@ fn bunyan_message_parts(message: &str, fields: &Map<String, Value>) -> Vec<Messa
     }
     parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
     parts
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TracingField {
+    key: String,
+    value: String,
+}
+
+fn tracing_message_parts(message: &str) -> Vec<MessagePart> {
+    let Some((message, fields)) = split_tracing_message_fields(message) else {
+        return vec![MessagePart::new(message, MessageStyle::Default)];
+    };
+
+    let mut parts = Vec::new();
+    if !message.is_empty() {
+        parts.push(MessagePart::new(message, MessageStyle::Default));
+        parts.push(MessagePart::new(" (", MessageStyle::JsonPunctuation));
+    } else {
+        parts.push(MessagePart::new("(", MessageStyle::JsonPunctuation));
+    }
+
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            parts.push(MessagePart::new(" ", MessageStyle::JsonPunctuation));
+        }
+        parts.push(MessagePart::new(&field.key, MessageStyle::JsonKey));
+        parts.push(MessagePart::new("=", MessageStyle::JsonPunctuation));
+        push_tracing_value_part(&mut parts, &field.value);
+    }
+    parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
+    parts
+}
+
+fn split_tracing_message_fields(message: &str) -> Option<(String, Vec<TracingField>)> {
+    for (idx, _) in message.char_indices() {
+        if idx > 0 && !message[..idx].ends_with(char::is_whitespace) {
+            continue;
+        }
+
+        let candidate = &message[idx..];
+        if let Some(fields) = parse_tracing_field_sequence(candidate) {
+            return Some((message[..idx].trim_end().to_string(), fields));
+        }
+    }
+
+    None
+}
+
+fn parse_tracing_field_sequence(value: &str) -> Option<Vec<TracingField>> {
+    let value = value.trim_start();
+    let (key, rest) = take_tracing_field_key(value)?;
+
+    for end in tracing_value_end_candidates(rest) {
+        let field_value = rest[..end].trim_end();
+        if field_value.is_empty() {
+            continue;
+        }
+
+        let tail = rest[end..].trim_start();
+        let field = TracingField {
+            key: key.to_string(),
+            value: field_value.to_string(),
+        };
+        if tail.is_empty() {
+            if unquoted_value_has_top_level_whitespace(field_value) {
+                continue;
+            }
+            return Some(vec![field]);
+        }
+
+        if let Some(mut fields) = parse_tracing_field_sequence(tail) {
+            fields.insert(0, field);
+            return Some(fields);
+        }
+    }
+
+    None
+}
+
+fn unquoted_value_has_top_level_whitespace(value: &str) -> bool {
+    if value.starts_with('"') {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for ch in value.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quote = true,
+            '{' | '[' | '(' => depth = depth.saturating_add(1),
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            ch if ch.is_whitespace() && depth == 0 => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn take_tracing_field_key(value: &str) -> Option<(&str, &str)> {
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    for (idx, ch) in chars {
+        if ch == '=' {
+            return Some((&value[..idx], &value[idx + ch.len_utf8()..]));
+        }
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')) {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn tracing_value_end_candidates(value: &str) -> Vec<usize> {
+    if value.starts_with('"') {
+        return quoted_value_end(value)
+            .map(|end| vec![end])
+            .unwrap_or_default();
+    }
+
+    let mut ends = Vec::new();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quote = true,
+            '{' | '[' | '(' => depth = depth.saturating_add(1),
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            ch if ch.is_whitespace() && depth == 0 => ends.push(idx),
+            _ => {}
+        }
+    }
+
+    ends.push(value.len());
+    ends
+}
+
+fn quoted_value_end(value: &str) -> Option<usize> {
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(idx + ch.len_utf8());
+        }
+    }
+
+    None
+}
+
+fn push_tracing_value_part(parts: &mut Vec<MessagePart>, value: &str) {
+    let style = if matches!(value, "true" | "false") {
+        MessageStyle::JsonBool
+    } else if value == "null" {
+        MessageStyle::JsonNull
+    } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        MessageStyle::JsonNumber
+    } else if value.starts_with('"') && value.ends_with('"') {
+        MessageStyle::JsonString
+    } else {
+        MessageStyle::Default
+    };
+
+    parts.push(MessagePart::new(value, style));
 }
 
 fn push_json_value_parts(parts: &mut Vec<MessagePart>, value: &Value) {
@@ -510,7 +714,7 @@ mod tests {
         Level::Info,
         &[],
         "fmt",
-        "preparing to shave yaks number_of_yaks=3",
+        "preparing to shave yaks (number_of_yaks=3)",
     )]
     #[case(
         "2022-02-15T18:40:14.289974Z  INFO shaving_yaks{yaks=3}: fmt::yak_shave: shaving yaks",
@@ -524,21 +728,21 @@ mod tests {
         Level::Trace,
         &["shaving_yaks{yaks=3}", "shave{yak=1}"],
         "fmt::yak_shave",
-        "hello! I'm gonna shave a yak excitement=\"yay!\"",
+        "hello! I'm gonna shave a yak (excitement=\"yay!\")",
     )]
     #[case(
         "2022-02-15T18:40:14.290157Z DEBUG shaving_yaks{yaks=3}: yak_events: yak=3 shaved=false",
         Level::Debug,
         &["shaving_yaks{yaks=3}"],
         "yak_events",
-        "yak=3 shaved=false",
+        "(yak=3 shaved=false)",
     )]
     #[case(
         "2022-02-15T18:40:14.290268Z ERROR shaving_yaks{yaks=3}: fmt::yak_shave: failed to shave yak yak=3 error=missing yak error.sources=[out of space, out of cash]",
         Level::Error,
         &["shaving_yaks{yaks=3}"],
         "fmt::yak_shave",
-        "failed to shave yak yak=3 error=missing yak error.sources=[out of space, out of cash]",
+        "failed to shave yak (yak=3 error=missing yak error.sources=[out of space, out of cash])",
     )]
     fn parses_tracing_fmt_documented_examples(
         #[case] line: &str,
@@ -553,6 +757,57 @@ mod tests {
         assert_eq!(entry.spans, spans);
         assert_eq!(entry.target.as_deref(), Some(target));
         assert_eq!(entry.message, message);
+    }
+
+    #[test]
+    fn parses_tracing_message_fields_as_structured_parts() {
+        let entry = parse_tracing(
+            "2026-06-15T12:01:02Z INFO svc: loaded user id=7 ok=true tag=\"admin\" error.sources=[out of space, out of cash]",
+        )
+        .expect("entry");
+
+        assert_eq!(
+            entry.message,
+            r#"loaded user (id=7 ok=true tag="admin" error.sources=[out of space, out of cash])"#
+        );
+        assert_eq!(
+            entry.message_parts,
+            vec![
+                MessagePart::new("loaded user", MessageStyle::Default),
+                MessagePart::new(" (", MessageStyle::JsonPunctuation),
+                MessagePart::new("id", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("7", MessageStyle::JsonNumber),
+                MessagePart::new(" ", MessageStyle::JsonPunctuation),
+                MessagePart::new("ok", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("true", MessageStyle::JsonBool),
+                MessagePart::new(" ", MessageStyle::JsonPunctuation),
+                MessagePart::new("tag", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("\"admin\"", MessageStyle::JsonString),
+                MessagePart::new(" ", MessageStyle::JsonPunctuation),
+                MessagePart::new("error.sources", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("[out of space, out of cash]", MessageStyle::Default),
+                MessagePart::new(")", MessageStyle::JsonPunctuation),
+            ]
+        );
+    }
+
+    #[test]
+    fn tracing_field_parser_keeps_equals_in_message_text() {
+        let entry = parse_tracing("2026-06-15T12:01:02Z INFO svc: user typed mode=debug yesterday")
+            .expect("entry");
+
+        assert_eq!(entry.message, "user typed mode=debug yesterday");
+        assert_eq!(
+            entry.message_parts,
+            vec![MessagePart::new(
+                "user typed mode=debug yesterday",
+                MessageStyle::Default
+            )]
+        );
     }
 
     #[test]
