@@ -23,3 +23,7 @@ rstest = "0.26.1"
 [[bin]]
 name = "tv"
 path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tv-{ target }{ binary-ext }"
+pkg-fmt = "bin"
