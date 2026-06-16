@@ -1,0 +1,183 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  init:
+    runs-on: ubuntu-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.state.outputs.prerelease }}
+    steps:
+      - name: Evaluate state
+        id: state
+        run: |
+          if [[ "${{ github.event.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo release=true >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.ref }}" =~ ^refs/tags/v.*$ ]]; then
+              echo prerelease=true >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo "$VERSION" | sed -e 's/^v//')
+          echo "Version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs:
+      - init
+      - ci
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+
+        include:
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            install: |
+              sudo apt install -y musl-tools
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            install: |
+              sudo apt install -y musl-tools
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            exe: ".exe"
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            exe: ".exe"
+            install: |
+              Invoke-WebRequest -Uri https://win.rustup.rs/aarch64 -OutFile rustup-init.exe
+              Start-Process -FilePath .\rustup-init.exe -ArgumentList "-y" -NoNewWindow -Wait
+              echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        if: matrix.install != null && matrix.install != ''
+        run: ${{ matrix.install }}
+
+      - name: Disable rustup auto update
+        run: rustup set auto-self-update disable
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target=${{ matrix.target }}
+
+      - name: Copy binary
+        shell: bash
+        run: |
+          mkdir -p upload
+
+          if [[ -f "target/release/tv${{ matrix.exe }}" ]]; then
+            SRC="target/release/tv${{ matrix.exe }}"
+          elif [[ -f "target/${{ matrix.target }}/release/tv${{ matrix.exe }}" ]]; then
+            SRC="target/${{ matrix.target }}/release/tv${{ matrix.exe }}"
+          else
+            echo "Unable to find output"
+            false
+          fi
+
+          cp -pv "${SRC}" "upload/tv-${{ matrix.target }}${{ matrix.exe }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: tv-${{ matrix.target }}
+          path: upload/tv-${{ matrix.target }}${{ matrix.exe }}
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - init
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install convco
+        run: |
+          curl -sLO https://github.com/convco/convco/releases/download/v0.6.4/convco-ubuntu.zip
+          unzip convco-ubuntu.zip
+          sudo install convco /usr/local/bin
+
+      - name: Generate changelog
+        run: convco changelog -s --max-majors=1 --max-minors=1 --max-patches=1 -n > /tmp/changelog.md
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: ~/download
+
+      - name: Stage release
+        run: |
+          mkdir -p staging
+          cp -pv ~/download/*/tv-* staging/
+
+      - name: Display staging area
+        run: ls -R staging
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.init.outputs.version }}
+        run: |
+          OPTS=""
+
+          if [[ "${{ needs.init.outputs.prerelease }}" == "true" ]]; then
+            OPTS="${OPTS} -p"
+          fi
+
+          gh release create ${OPTS} --title "${{ needs.init.outputs.version }}" -F /tmp/changelog.md "${TAG}" \
+            $(find staging -type f)
+
+      - name: Create attestations
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: staging/tv-*
