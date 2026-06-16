@@ -21,6 +21,7 @@ pub(crate) struct ViewState {
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
     pub(crate) show_spans: bool,
+    pub(crate) focus_target: Option<String>,
 }
 
 impl ViewState {
@@ -31,9 +32,10 @@ impl ViewState {
         }
     }
 
-    pub(crate) fn follow_latest(&mut self, len: usize, page_size: usize) {
-        self.selected = len.checked_sub(1);
-        self.scroll_selected_into_view(len, page_size);
+    pub(crate) fn follow_latest(&mut self, entries: &VecDeque<LogEntry>, page_size: usize) {
+        let visible = visible_indices(entries, self);
+        self.selected = visible.last().copied();
+        self.scroll_selected_into_view(entries, page_size);
     }
 
     pub(crate) fn remove_first_line(&mut self) {
@@ -41,51 +43,67 @@ impl ViewState {
         self.selected = self.selected.map(|selected| selected.saturating_sub(1));
     }
 
-    fn move_selected_to(&mut self, selected: usize, len: usize, page_size: usize) {
-        self.selected = if len == 0 {
-            None
-        } else {
-            Some(cmp::min(selected, len - 1))
-        };
-        self.scroll_selected_into_view(len, page_size);
+    fn move_selected_to(&mut self, visible: &[usize], selected_visible: usize, page_size: usize) {
+        self.selected = visible.get(selected_visible).copied();
+        self.scroll_selected_into_visible_slice(visible, page_size);
     }
 
-    fn move_selected_by(&mut self, delta: isize, len: usize, page_size: usize) {
-        let Some(selected) = self.selected.or_else(|| len.checked_sub(1)) else {
+    fn move_selected_by(&mut self, visible: &[usize], delta: isize, page_size: usize) {
+        let Some(selected_pos) = selected_visible_pos(visible, self.selected) else {
             return;
         };
-        let selected = if delta.is_negative() {
-            selected.saturating_sub(delta.unsigned_abs())
+        let selected_pos = if delta.is_negative() {
+            selected_pos.saturating_sub(delta.unsigned_abs())
         } else {
             cmp::min(
-                selected.saturating_add(delta as usize),
-                len.saturating_sub(1),
+                selected_pos.saturating_add(delta as usize),
+                visible.len().saturating_sub(1),
             )
         };
 
-        self.move_selected_to(selected, len, page_size);
+        self.move_selected_to(visible, selected_pos, page_size);
     }
 
-    fn scroll_selected_into_view(&mut self, len: usize, page_size: usize) {
+    fn scroll_selected_into_view(&mut self, entries: &VecDeque<LogEntry>, page_size: usize) {
+        let visible = visible_indices(entries, self);
+        self.scroll_selected_into_visible_slice(&visible, page_size);
+    }
+
+    fn scroll_selected_into_visible_slice(&mut self, visible: &[usize], page_size: usize) {
         let Some(selected) = self.selected else {
             self.first_visible = 0;
             return;
         };
-        if len == 0 {
+        let Some(selected_pos) = visible.iter().position(|idx| *idx == selected) else {
+            self.first_visible = visible.first().copied().unwrap_or(0);
+            self.selected = visible.last().copied();
+            return;
+        };
+        if visible.is_empty() {
             self.first_visible = 0;
             self.selected = None;
             return;
         }
 
         let page_size = cmp::max(1, page_size);
-        let max_first_visible = len.saturating_sub(page_size);
-        self.first_visible = cmp::min(self.first_visible, max_first_visible);
+        let first_pos = visible
+            .iter()
+            .position(|idx| *idx == self.first_visible)
+            .unwrap_or_else(|| {
+                visible
+                    .iter()
+                    .position(|idx| *idx >= self.first_visible)
+                    .unwrap_or_else(|| visible.len().saturating_sub(1))
+            });
+        let max_first_pos = visible.len().saturating_sub(page_size);
+        let mut first_pos = cmp::min(first_pos, max_first_pos);
 
-        if selected < self.first_visible {
-            self.first_visible = selected;
-        } else if selected >= self.first_visible.saturating_add(page_size) {
-            self.first_visible = selected.saturating_add(1).saturating_sub(page_size);
+        if selected_pos < first_pos {
+            first_pos = selected_pos;
+        } else if selected_pos >= first_pos.saturating_add(page_size) {
+            first_pos = selected_pos.saturating_add(1).saturating_sub(page_size);
         }
+        self.first_visible = visible[first_pos];
     }
 }
 
@@ -103,7 +121,7 @@ pub(crate) fn handle_key(
     process_exited: bool,
     page_size: usize,
 ) -> KeyAction {
-    let len = entries.len();
+    let visible = visible_indices(entries, state);
     let page_step = cmp::max(1, page_size.saturating_sub(1));
     const HORIZONTAL_SCROLL_STEP: usize = 16;
 
@@ -124,6 +142,18 @@ pub(crate) fn handle_key(
             state.show_spans = !state.show_spans;
             return KeyAction::Continue;
         }
+        KeyCode::Char('f') => {
+            state.focus_target = if state.focus_target.is_some() {
+                None
+            } else {
+                state
+                    .selected
+                    .and_then(|selected| entries.get(selected))
+                    .and_then(|entry| entry.target.clone())
+            };
+            state.scroll_selected_into_view(entries, page_size);
+            return KeyAction::Continue;
+        }
         KeyCode::Char('y') => return KeyAction::CopySelected,
         KeyCode::Char('q') | KeyCode::Esc => {
             if process_exited {
@@ -136,12 +166,14 @@ pub(crate) fn handle_key(
         KeyCode::Right => {
             state.x_offset = state.x_offset.saturating_add(HORIZONTAL_SCROLL_STEP);
         }
-        KeyCode::Home => state.move_selected_to(0, len, page_size),
-        KeyCode::End => state.move_selected_to(len.saturating_sub(1), len, page_size),
-        KeyCode::Up => state.move_selected_by(-1, len, page_size),
-        KeyCode::Down => state.move_selected_by(1, len, page_size),
-        KeyCode::PageUp => state.move_selected_by(-(page_step as isize), len, page_size),
-        KeyCode::PageDown => state.move_selected_by(page_step as isize, len, page_size),
+        KeyCode::Home => state.move_selected_to(&visible, 0, page_size),
+        KeyCode::End => {
+            state.move_selected_to(&visible, visible.len().saturating_sub(1), page_size)
+        }
+        KeyCode::Up => state.move_selected_by(&visible, -1, page_size),
+        KeyCode::Down => state.move_selected_by(&visible, 1, page_size),
+        KeyCode::PageUp => state.move_selected_by(&visible, -(page_step as isize), page_size),
+        KeyCode::PageDown => state.move_selected_by(&visible, page_step as isize, page_size),
         _ => {}
     }
 
@@ -171,18 +203,25 @@ pub(crate) fn draw(
 
     let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
     let log_width = (cols as usize).saturating_sub(scrollbar_width);
+    let visible = visible_indices(entries, state);
     let selected = state
         .selected
-        .unwrap_or_else(|| entries.len().saturating_sub(1));
-    let start = cmp::min(
-        state.first_visible,
-        entries.len().saturating_sub(content_rows),
-    );
-    let end = cmp::min(start + content_rows, entries.len());
+        .filter(|selected| visible.contains(selected))
+        .or_else(|| visible.last().copied());
+    let start_pos = visible
+        .iter()
+        .position(|idx| *idx == state.first_visible)
+        .unwrap_or_else(|| {
+            visible
+                .iter()
+                .position(|idx| *idx >= state.first_visible)
+                .unwrap_or(0)
+        });
+    let end_pos = cmp::min(start_pos + content_rows, visible.len());
 
     queue!(stdout, Hide, Clear(ClearType::All))?;
 
-    for (screen_row, idx) in (start..end).enumerate() {
+    for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
         let Some(entry) = entries.get(idx) else {
             continue;
         };
@@ -192,7 +231,7 @@ pub(crate) fn draw(
             entry,
             state.x_offset,
             log_width,
-            idx == selected,
+            Some(idx) == selected,
         )?;
     }
 
@@ -200,8 +239,9 @@ pub(crate) fn draw(
         draw_scrollbar(
             stdout,
             entries,
-            start,
-            end,
+            &visible,
+            start_pos,
+            end_pos,
             content_rows,
             cols.saturating_sub(1),
         )?;
@@ -220,15 +260,16 @@ pub(crate) fn draw(
 fn draw_scrollbar(
     stdout: &mut impl Write,
     entries: &VecDeque<LogEntry>,
+    visible_indices: &[usize],
     visible_start: usize,
     visible_end: usize,
     height: usize,
     column: u16,
 ) -> Result<()> {
     for row in 0..height {
-        let slice = ScrollbarSlice::new(row, height, entries.len());
+        let slice = ScrollbarSlice::new(row, height, visible_indices.len());
         let in_view = slice.start < visible_end && slice.end > visible_start;
-        let color = scrollbar_slice_color(entries, slice.start, slice.end);
+        let color = scrollbar_slice_color(entries, visible_indices, slice.start, slice.end);
         let marker = if in_view { "#" } else { "|" };
         let mut styled = style(marker).with(color);
         if in_view {
@@ -257,6 +298,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  Left / Right    scroll horizontally",
         "",
         "Actions",
+        "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  y               copy selected line to clipboard",
         "  ?               toggle this help page",
@@ -286,6 +328,27 @@ pub(crate) fn selected_line_text(
     entries
         .get(state.selected?)
         .map(|entry| EntryRenderer::from(state).plain_text(entry))
+}
+
+fn visible_indices(entries: &VecDeque<LogEntry>, state: &ViewState) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry_visible(entry, state).then_some(idx))
+        .collect()
+}
+
+fn entry_visible(entry: &LogEntry, state: &ViewState) -> bool {
+    state
+        .focus_target
+        .as_deref()
+        .is_none_or(|target| entry.target.as_deref() == Some(target))
+}
+
+fn selected_visible_pos(visible: &[usize], selected: Option<usize>) -> Option<usize> {
+    selected
+        .and_then(|selected| visible.iter().position(|idx| *idx == selected))
+        .or_else(|| visible.len().checked_sub(1))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -708,9 +771,14 @@ fn status_line(
         Some(status) => format!("exited {status}"),
         None => "running".to_string(),
     };
+    let focus = state
+        .focus_target
+        .as_deref()
+        .map(|target| format!(" | focus {target}"))
+        .unwrap_or_default();
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | ? help ",
+        " {process} | line {selected}/{entries}{follow} | x={} | spans {}{focus} | ? help ",
         state.x_offset,
         if state.show_spans { "on" } else { "off" }
     );
@@ -842,11 +910,17 @@ fn message_color(entry: &LogEntry) -> Color {
     }
 }
 
-fn scrollbar_slice_color(entries: &VecDeque<LogEntry>, start: usize, end: usize) -> Color {
-    entries
+fn scrollbar_slice_color(
+    entries: &VecDeque<LogEntry>,
+    visible_indices: &[usize],
+    start: usize,
+    end: usize,
+) -> Color {
+    visible_indices
         .iter()
         .skip(start)
         .take(end.saturating_sub(start))
+        .filter_map(|idx| entries.get(*idx))
         .map(|entry| entry.level)
         .max_by_key(|level| level.severity())
         .map(level_scrollbar_color)
@@ -894,6 +968,18 @@ mod tests {
             target: None,
             spans: Vec::new(),
             message: "line".to_string(),
+            stream: Stream::Stdout,
+        }
+    }
+
+    fn entry_with_target(target: Option<&str>, message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: None,
+            level: Level::Info,
+            parsed: true,
+            target: target.map(str::to_string),
+            spans: Vec::new(),
+            message: message.to_string(),
             stream: Stream::Stdout,
         }
     }
@@ -978,6 +1064,65 @@ mod tests {
 
         handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5);
         assert!(state.show_spans);
+    }
+
+    #[test]
+    fn f_focuses_selected_target_and_clears_focus() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "one"),
+            entry_with_target(Some("beta"), "two"),
+            entry_with_target(Some("alpha"), "three"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(2),
+            first_visible: 2,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('f')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert_eq!(state.focus_target.as_deref(), Some("alpha"));
+        assert_eq!(visible_indices(&entries, &state), vec![0, 2]);
+        assert_eq!(state.selected, Some(2));
+
+        handle_key(key(KeyCode::Char('f')), &entries, &mut state, false, 5);
+        assert_eq!(state.focus_target, None);
+        assert_eq!(visible_indices(&entries, &state), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn focused_navigation_skips_other_targets() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "one"),
+            entry_with_target(Some("beta"), "two"),
+            entry_with_target(Some("alpha"), "three"),
+            entry_with_target(Some("beta"), "four"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(0),
+            focus_target: Some("alpha".to_string()),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(2));
+
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn f_without_selected_target_keeps_focus_clear() {
+        let entries = VecDeque::from([entry_with_target(None, "plain")]);
+        let mut state = ViewState {
+            selected: Some(0),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('f')), &entries, &mut state, false, 5);
+        assert_eq!(state.focus_target, None);
     }
 
     #[test]
@@ -1067,7 +1212,7 @@ mod tests {
     fn cursor_moves_on_screen_before_scrolling_up() {
         let entries = entries(10);
         let mut state = ViewState::new();
-        state.follow_latest(entries.len(), 5);
+        state.follow_latest(&entries, 5);
 
         handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
         assert_eq!(state.selected, Some(8));
@@ -1169,9 +1314,17 @@ mod tests {
             entry_with_level(Level::Error),
         ]);
 
-        assert_eq!(scrollbar_slice_color(&entries, 0, 2), Color::Green);
-        assert_eq!(scrollbar_slice_color(&entries, 0, 3), Color::Yellow);
-        assert_eq!(scrollbar_slice_color(&entries, 0, 4), Color::Red);
+        let visible = [0, 1, 2, 3];
+
+        assert_eq!(
+            scrollbar_slice_color(&entries, &visible, 0, 2),
+            Color::Green
+        );
+        assert_eq!(
+            scrollbar_slice_color(&entries, &visible, 0, 3),
+            Color::Yellow
+        );
+        assert_eq!(scrollbar_slice_color(&entries, &visible, 0, 4), Color::Red);
     }
 
     #[test]

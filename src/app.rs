@@ -61,7 +61,7 @@ fn event_loop(
                     }
                     entries.push_back(parse_log_line(format, stream, line));
                     if was_following_latest {
-                        state.follow_latest(entries.len(), page_size);
+                        state.follow_latest(&entries, page_size);
                     }
                     dirty = true;
                 }

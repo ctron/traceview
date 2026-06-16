@@ -44,6 +44,8 @@ Up / Down       move cursor one line
 PgUp / PgDown   move cursor one page
 Home / End      jump to first or last retained line
 Left / Right    scroll horizontally
+f               focus selected target, or clear focus
+s               toggle span information
 y               copy selected line to clipboard
 ?               toggle help
 q / Esc         exit after the process ends
