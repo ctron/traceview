@@ -2,7 +2,7 @@
 name = "traceviewer"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Run a command and inspect its logs in a scrollable terminal viewer"
 readme = "README.md"
 repository = "https://github.com/ctron/traceview"
