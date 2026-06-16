@@ -1,2 +1,4 @@
 /target/
-/Cargo.toml.orig
+/.codex/
+/.agents/
+/.idea/

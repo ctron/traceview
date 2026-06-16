@@ -1,5 +1,8 @@
 # traceview
 
+[![CI](https://github.com/ctron/traceview/actions/workflows/ci.yml/badge.svg)](https://github.com/ctron/traceview/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/traceview.svg)](https://crates.io/crates/traceview)
+
 `traceview` runs a command and shows its output in a scrollable terminal log
 viewer.
 
