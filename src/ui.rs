@@ -20,9 +20,17 @@ pub(crate) struct ViewState {
     pub(crate) first_visible: usize,
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
+    pub(crate) show_spans: bool,
 }
 
 impl ViewState {
+    pub(crate) fn new() -> Self {
+        Self {
+            show_spans: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn follow_latest(&mut self, len: usize, page_size: usize) {
         self.selected = len.checked_sub(1);
         self.scroll_selected_into_view(len, page_size);
@@ -111,6 +119,10 @@ pub(crate) fn handle_key(
             return KeyAction::Continue;
         }
         _ if state.help_visible => return KeyAction::Continue,
+        KeyCode::Char('s') => {
+            state.show_spans = !state.show_spans;
+            return KeyAction::Continue;
+        }
         KeyCode::Char('y') => return KeyAction::CopySelected,
         KeyCode::Char('q') | KeyCode::Esc => {
             if process_exited {
@@ -170,7 +182,13 @@ pub(crate) fn draw(
             continue;
         };
         queue!(stdout, MoveTo(0, screen_row as u16))?;
-        draw_entry(stdout, entry, state.x_offset, log_width, idx == selected)?;
+        EntryRenderer::from(state).draw(
+            stdout,
+            entry,
+            state.x_offset,
+            log_width,
+            idx == selected,
+        )?;
     }
 
     if scrollbar_width > 0 {
@@ -234,6 +252,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  Left / Right    scroll horizontally",
         "",
         "Actions",
+        "  s               toggle span information",
         "  y               copy selected line to clipboard",
         "  ?               toggle this help page",
         "  q / Esc         close help, or exit after the process ends",
@@ -255,198 +274,253 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
     Ok(())
 }
 
-fn draw_entry(
-    stdout: &mut impl Write,
-    entry: &LogEntry,
-    x_offset: usize,
-    width: usize,
-    selected: bool,
-) -> Result<()> {
-    let mut parts = Vec::new();
-    push_entry_parts(&mut parts, entry);
-
-    let mut rendered = String::new();
-    for (text, _, _) in &parts {
-        rendered.push_str(text);
-    }
-    let rendered_width = rendered.chars().count();
-    if width == 0 {
-        return Ok(());
-    }
-
-    let viewport = LineViewport::new(rendered_width, x_offset, width);
-    let content_width = viewport.content_width;
-    let visible = visible_slice(&rendered, x_offset, content_width);
-    let mut cursor = 0usize;
-
-    if viewport.show_left_marker {
-        print_segment(stdout, "<".to_string(), Color::DarkGrey, true, selected)?;
-    }
-
-    for (text, color, bold) in parts {
-        let part_start = cursor;
-        let part_end = cursor + text.chars().count();
-        cursor = part_end;
-
-        let overlap_start = cmp::max(part_start, x_offset);
-        let overlap_end = cmp::min(part_end, x_offset.saturating_add(content_width));
-        if overlap_start >= overlap_end {
-            continue;
-        }
-
-        let local_start = overlap_start - part_start;
-        let local_len = overlap_end - overlap_start;
-        let segment: String = text.chars().skip(local_start).take(local_len).collect();
-        print_segment(stdout, segment, color, bold, selected)?;
-    }
-
-    let remaining = content_width.saturating_sub(visible.chars().count());
-    if remaining > 0 {
-        print_segment(stdout, " ".repeat(remaining), Color::White, false, selected)?;
-    }
-
-    if viewport.show_right_marker {
-        print_segment(stdout, ">".to_string(), Color::DarkGrey, true, selected)?;
-    }
-
-    if selected {
-        queue!(stdout, ResetColor)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn selected_line_text(
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
 ) -> Option<String> {
-    let entry = entries.get(state.selected?)?;
-    let mut parts = Vec::new();
-    push_entry_parts(&mut parts, entry);
-    Some(parts.into_iter().map(|(text, _, _)| text).collect())
+    entries
+        .get(state.selected?)
+        .map(|entry| EntryRenderer::from(state).plain_text(entry))
 }
 
-fn push_entry_parts(parts: &mut Vec<(String, Color, bool)>, entry: &LogEntry) {
-    parts.push((
-        format!("{} ", entry.stream.indicator()),
-        stream_color(entry.stream),
-        true,
-    ));
-    if let Some(timestamp) = &entry.timestamp {
-        parts.push((format!("{timestamp} "), Color::DarkGrey, false));
+#[derive(Clone, Copy, Debug)]
+struct RenderOptions {
+    show_spans: bool,
+}
+
+impl From<&ViewState> for RenderOptions {
+    fn from(state: &ViewState) -> Self {
+        Self {
+            show_spans: state.show_spans,
+        }
     }
-    if entry.parsed {
-        parts.push((
-            format!("{:<5} ", entry.level.label()),
-            level_color(entry.level),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Part {
+    text: String,
+    color: Color,
+    bold: bool,
+}
+
+impl Part {
+    fn new(text: impl Into<String>, color: Color, bold: bool) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            bold,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EntryRenderer {
+    options: RenderOptions,
+}
+
+impl EntryRenderer {
+    fn from(state: &ViewState) -> Self {
+        Self {
+            options: RenderOptions::from(state),
+        }
+    }
+
+    fn draw(
+        self,
+        stdout: &mut impl Write,
+        entry: &LogEntry,
+        x_offset: usize,
+        width: usize,
+        selected: bool,
+    ) -> Result<()> {
+        let parts = self.parts(entry);
+        let rendered = Self::plain_text_from_parts(&parts);
+        let rendered_width = rendered.chars().count();
+        if width == 0 {
+            return Ok(());
+        }
+
+        let viewport = LineViewport::new(rendered_width, x_offset, width);
+        let content_width = viewport.content_width;
+        let visible = visible_slice(&rendered, x_offset, content_width);
+        let mut cursor = 0usize;
+
+        if viewport.show_left_marker {
+            print_segment(stdout, "<".to_string(), Color::DarkGrey, true, selected)?;
+        }
+
+        for part in parts {
+            let part_start = cursor;
+            let part_end = cursor + part.text.chars().count();
+            cursor = part_end;
+
+            let overlap_start = cmp::max(part_start, x_offset);
+            let overlap_end = cmp::min(part_end, x_offset.saturating_add(content_width));
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let local_start = overlap_start - part_start;
+            let local_len = overlap_end - overlap_start;
+            let segment: String = part
+                .text
+                .chars()
+                .skip(local_start)
+                .take(local_len)
+                .collect();
+            print_segment(stdout, segment, part.color, part.bold, selected)?;
+        }
+
+        let remaining = content_width.saturating_sub(visible.chars().count());
+        if remaining > 0 {
+            print_segment(stdout, " ".repeat(remaining), Color::White, false, selected)?;
+        }
+
+        if viewport.show_right_marker {
+            print_segment(stdout, ">".to_string(), Color::DarkGrey, true, selected)?;
+        }
+
+        if selected {
+            queue!(stdout, ResetColor)?;
+        }
+        Ok(())
+    }
+
+    fn plain_text(self, entry: &LogEntry) -> String {
+        Self::plain_text_from_parts(&self.parts(entry))
+    }
+
+    fn plain_text_from_parts(parts: &[Part]) -> String {
+        parts.iter().map(|part| part.text.as_str()).collect()
+    }
+
+    fn parts(self, entry: &LogEntry) -> Vec<Part> {
+        let mut parts = Vec::new();
+        parts.push(Part::new(
+            format!("{} ", entry.stream.indicator()),
+            stream_color(entry.stream),
             true,
         ));
-    }
-    if let Some(target) = &entry.target {
-        push_target_parts(parts, target);
-    }
-    push_span_parts(parts, &entry.spans);
-    push_message_parts(parts, &entry.message, message_color(entry));
-}
-
-fn push_target_parts(parts: &mut Vec<(String, Color, bool)>, target: &str) {
-    let split_at = target
-        .char_indices()
-        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
-        .unwrap_or(target.len());
-    let (module_path, suffix) = target.split_at(split_at);
-
-    let mut modules = module_path.split("::").peekable();
-    while let Some(module) = modules.next() {
-        parts.push((module.to_string(), target_module_color(module), false));
-        if modules.peek().is_some() {
-            parts.push(("::".to_string(), Color::DarkGrey, false));
+        if let Some(timestamp) = &entry.timestamp {
+            parts.push(Part::new(format!("{timestamp} "), Color::DarkGrey, false));
         }
+        if entry.parsed {
+            parts.push(Part::new(
+                format!("{:<5} ", entry.level.label()),
+                level_color(entry.level),
+                true,
+            ));
+        }
+        if let Some(target) = &entry.target {
+            self.push_target_parts(&mut parts, target);
+        }
+        if self.options.show_spans {
+            self.push_span_parts(&mut parts, &entry.spans);
+        }
+        self.push_message_parts(&mut parts, &entry.message, message_color(entry));
+        parts
     }
-    if !suffix.is_empty() {
-        parts.push((suffix.to_string(), Color::DarkGrey, false));
-    }
-    parts.push((": ".to_string(), Color::DarkGrey, false));
-}
 
-fn push_span_parts(parts: &mut Vec<(String, Color, bool)>, spans: &[String]) {
-    for span in spans {
-        push_span_part(parts, span);
-        parts.push((": ".to_string(), Color::DarkGrey, false));
-    }
-}
+    fn push_target_parts(self, parts: &mut Vec<Part>, target: &str) {
+        let split_at = target
+            .char_indices()
+            .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+            .unwrap_or(target.len());
+        let (module_path, suffix) = target.split_at(split_at);
 
-fn push_span_part(parts: &mut Vec<(String, Color, bool)>, span: &str) {
-    if let Some(open) = span.find('{') {
-        let (name, fields) = span.split_at(open);
-        parts.push((name.to_string(), span_name_color(name), false));
-        push_span_fields(parts, fields);
-    } else {
-        parts.push((span.to_string(), span_name_color(span), false));
-    }
-}
-
-fn push_span_fields(parts: &mut Vec<(String, Color, bool)>, fields: &str) {
-    let mut current = String::new();
-    let mut token = String::new();
-    let mut chars = fields.chars().peekable();
-    let mut in_string = false;
-    let mut expecting_key = true;
-    let mut expecting_value = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            token.push(ch);
-            if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    token.push(next);
-                }
-            } else if ch == '"' {
-                parts.push((std::mem::take(&mut token), string_color(), false));
-                in_string = false;
-                expecting_value = false;
+        let mut modules = module_path.split("::").peekable();
+        while let Some(module) = modules.next() {
+            parts.push(Part::new(module, target_module_color(module), false));
+            if modules.peek().is_some() {
+                parts.push(Part::new("::", Color::DarkGrey, false));
             }
-            continue;
         }
+        if !suffix.is_empty() {
+            parts.push(Part::new(suffix, Color::DarkGrey, false));
+        }
+        parts.push(Part::new(": ", Color::DarkGrey, false));
+    }
 
-        match ch {
-            '"' => {
-                flush_span_token(parts, &mut token, expecting_key, expecting_value);
+    fn push_span_parts(self, parts: &mut Vec<Part>, spans: &[String]) {
+        for span in spans {
+            self.push_span_part(parts, span);
+            parts.push(Part::new(": ", Color::DarkGrey, false));
+        }
+    }
+
+    fn push_span_part(self, parts: &mut Vec<Part>, span: &str) {
+        if let Some(open) = span.find('{') {
+            let (name, fields) = span.split_at(open);
+            parts.push(Part::new(name, span_name_color(name), false));
+            self.push_span_fields(parts, fields);
+        } else {
+            parts.push(Part::new(span, span_name_color(span), false));
+        }
+    }
+
+    fn push_span_fields(self, parts: &mut Vec<Part>, fields: &str) {
+        let mut current = String::new();
+        let mut token = String::new();
+        let mut chars = fields.chars().peekable();
+        let mut in_string = false;
+        let mut expecting_key = true;
+        let mut expecting_value = false;
+
+        while let Some(ch) = chars.next() {
+            if in_string {
                 token.push(ch);
-                in_string = true;
-            }
-            '=' | ':' => {
-                flush_span_token(parts, &mut token, expecting_key, expecting_value);
-                parts.push((ch.to_string(), span_punctuation_color(), false));
-                expecting_key = false;
-                expecting_value = true;
-            }
-            '{' | '}' | '(' | ')' | '[' | ']' | ',' => {
-                flush_span_token(parts, &mut token, expecting_key, expecting_value);
-                parts.push((ch.to_string(), span_punctuation_color(), false));
-                expecting_key = matches!(ch, '{' | ',' | '(');
-                expecting_value = false;
-            }
-            ch if ch.is_whitespace() => {
-                flush_span_token(parts, &mut token, expecting_key, expecting_value);
-                current.push(ch);
-                if !current.is_empty() {
-                    parts.push((std::mem::take(&mut current), Color::Reset, false));
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        token.push(next);
+                    }
+                } else if ch == '"' {
+                    parts.push(Part::new(std::mem::take(&mut token), string_color(), false));
+                    in_string = false;
+                    expecting_value = false;
                 }
-                expecting_key = !expecting_value;
+                continue;
             }
-            _ => token.push(ch),
-        }
-    }
 
-    if in_string {
-        parts.push((token, string_color(), false));
-    } else {
-        flush_span_token(parts, &mut token, expecting_key, expecting_value);
+            match ch {
+                '"' => {
+                    flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                    token.push(ch);
+                    in_string = true;
+                }
+                '=' | ':' => {
+                    flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                    parts.push(Part::new(ch.to_string(), span_punctuation_color(), false));
+                    expecting_key = false;
+                    expecting_value = true;
+                }
+                '{' | '}' | '(' | ')' | '[' | ']' | ',' => {
+                    flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                    parts.push(Part::new(ch.to_string(), span_punctuation_color(), false));
+                    expecting_key = matches!(ch, '{' | ',' | '(');
+                    expecting_value = false;
+                }
+                ch if ch.is_whitespace() => {
+                    flush_span_token(parts, &mut token, expecting_key, expecting_value);
+                    current.push(ch);
+                    if !current.is_empty() {
+                        parts.push(Part::new(std::mem::take(&mut current), Color::Reset, false));
+                    }
+                    expecting_key = !expecting_value;
+                }
+                _ => token.push(ch),
+            }
+        }
+
+        if in_string {
+            parts.push(Part::new(token, string_color(), false));
+        } else {
+            flush_span_token(parts, &mut token, expecting_key, expecting_value);
+        }
     }
 }
 
 fn flush_span_token(
-    parts: &mut Vec<(String, Color, bool)>,
+    parts: &mut Vec<Part>,
     token: &mut String,
     expecting_key: bool,
     expecting_value: bool,
@@ -462,48 +536,54 @@ fn flush_span_token(
     } else {
         Color::Reset
     };
-    parts.push((std::mem::take(token), color, false));
+    parts.push(Part::new(std::mem::take(token), color, false));
 }
 
-fn push_message_parts(parts: &mut Vec<(String, Color, bool)>, message: &str, base_color: Color) {
-    let mut current = String::new();
-    let mut chars = message.chars().peekable();
-    let mut in_string = false;
+impl EntryRenderer {
+    fn push_message_parts(self, parts: &mut Vec<Part>, message: &str, base_color: Color) {
+        let mut current = String::new();
+        let mut chars = message.chars().peekable();
+        let mut in_string = false;
 
-    while let Some(ch) = chars.next() {
-        current.push(ch);
+        while let Some(ch) = chars.next() {
+            current.push(ch);
 
-        if ch == '\\' && in_string {
-            if let Some(next) = chars.next() {
-                current.push(next);
+            if ch == '\\' && in_string {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                continue;
             }
-            continue;
-        }
 
-        if ch != '"' {
-            continue;
-        }
-
-        if in_string {
-            parts.push((std::mem::take(&mut current), string_color(), false));
-            in_string = false;
-        } else {
-            if current.len() > ch.len_utf8() {
-                let quote = current.split_off(current.len() - ch.len_utf8());
-                parts.push((std::mem::take(&mut current), base_color, false));
-                current = quote;
+            if ch != '"' {
+                continue;
             }
-            in_string = true;
-        }
-    }
 
-    if !current.is_empty() {
-        let color = if in_string {
-            string_color()
-        } else {
-            base_color
-        };
-        parts.push((current, color, false));
+            if in_string {
+                parts.push(Part::new(
+                    std::mem::take(&mut current),
+                    string_color(),
+                    false,
+                ));
+                in_string = false;
+            } else {
+                if current.len() > ch.len_utf8() {
+                    let quote = current.split_off(current.len() - ch.len_utf8());
+                    parts.push(Part::new(std::mem::take(&mut current), base_color, false));
+                    current = quote;
+                }
+                in_string = true;
+            }
+        }
+
+        if !current.is_empty() {
+            let color = if in_string {
+                string_color()
+            } else {
+                base_color
+            };
+            parts.push(Part::new(current, color, false));
+        }
     }
 }
 
@@ -625,8 +705,9 @@ fn status_line(
     };
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | ? help ",
-        state.x_offset
+        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | ? help ",
+        state.x_offset,
+        if state.show_spans { "on" } else { "off" }
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
 }
@@ -816,10 +897,16 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn renderer() -> EntryRenderer {
+        EntryRenderer {
+            options: RenderOptions { show_spans: true },
+        }
+    }
+
     #[test]
     fn home_and_end_move_to_first_and_last_lines() {
         let entries = entries(10);
-        let mut state = ViewState::default();
+        let mut state = ViewState::new();
 
         handle_key(key(KeyCode::Home), &entries, &mut state, false, 5);
         assert_eq!(state.selected, Some(0));
@@ -831,7 +918,7 @@ mod tests {
     #[test]
     fn page_keys_move_by_visible_page() {
         let entries = entries(20);
-        let mut state = ViewState::default();
+        let mut state = ViewState::new();
 
         assert_eq!(
             handle_key(key(KeyCode::PageUp), &entries, &mut state, false, 6),
@@ -846,7 +933,7 @@ mod tests {
     #[test]
     fn y_requests_copy_selected_line() {
         let entries = entries(1);
-        let mut state = ViewState::default();
+        let mut state = ViewState::new();
 
         assert_eq!(
             handle_key(key(KeyCode::Char('y')), &entries, &mut state, false, 5),
@@ -857,7 +944,7 @@ mod tests {
     #[test]
     fn question_mark_toggles_help_page() {
         let entries = entries(1);
-        let mut state = ViewState::default();
+        let mut state = ViewState::new();
 
         assert_eq!(
             handle_key(key(KeyCode::Char('?')), &entries, &mut state, false, 5),
@@ -873,13 +960,29 @@ mod tests {
     }
 
     #[test]
+    fn s_toggles_span_information() {
+        let entries = entries(1);
+        let mut state = ViewState::new();
+
+        assert!(state.show_spans);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(!state.show_spans);
+
+        handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5);
+        assert!(state.show_spans);
+    }
+
+    #[test]
     fn help_page_ignores_navigation_until_closed() {
         let entries = entries(10);
         let mut state = ViewState {
             help_visible: true,
             selected: Some(9),
             first_visible: 5,
-            ..ViewState::default()
+            ..ViewState::new()
         };
 
         assert_eq!(
@@ -906,7 +1009,7 @@ mod tests {
         }]);
         let state = ViewState {
             selected: Some(0),
-            ..ViewState::default()
+            ..ViewState::new()
         };
 
         assert_eq!(
@@ -916,9 +1019,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_line_text_omits_spans_when_hidden() {
+        let entries = VecDeque::from([LogEntry {
+            timestamp: Some("2026-06-15T12:01:02Z".to_string()),
+            level: Level::Info,
+            parsed: true,
+            target: Some("my_crate::worker".to_string()),
+            spans: vec!["request{id=7}".to_string()],
+            message: "loaded \"user\"".to_string(),
+            stream: Stream::Stdout,
+        }]);
+        let state = ViewState {
+            selected: Some(0),
+            show_spans: false,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| 2026-06-15T12:01:02Z INFO  my_crate::worker: loaded \"user\"")
+        );
+    }
+
+    #[test]
     fn cursor_moves_on_screen_before_scrolling_up() {
         let entries = entries(10);
-        let mut state = ViewState::default();
+        let mut state = ViewState::new();
         state.follow_latest(entries.len(), 5);
 
         handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
@@ -942,7 +1068,7 @@ mod tests {
         let mut state = ViewState {
             first_visible: 2,
             selected: Some(2),
-            ..ViewState::default()
+            ..ViewState::new()
         };
 
         handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
@@ -1040,25 +1166,25 @@ mod tests {
     #[test]
     fn target_parts_split_rust_modules_and_keep_separators_neutral() {
         let mut parts = Vec::new();
-        push_target_parts(&mut parts, "my_crate::worker::db");
+        renderer().push_target_parts(&mut parts, "my_crate::worker::db");
 
-        let text: String = parts.iter().map(|(text, _, _)| text.as_str()).collect();
+        let text = EntryRenderer::plain_text_from_parts(&parts);
         assert_eq!(text, "my_crate::worker::db: ");
-        assert_eq!(parts[1], ("::".to_string(), Color::DarkGrey, false));
-        assert_eq!(parts[3], ("::".to_string(), Color::DarkGrey, false));
-        assert_eq!(parts[5], (": ".to_string(), Color::DarkGrey, false));
+        assert_eq!(parts[1], Part::new("::", Color::DarkGrey, false));
+        assert_eq!(parts[3], Part::new("::", Color::DarkGrey, false));
+        assert_eq!(parts[5], Part::new(": ", Color::DarkGrey, false));
     }
 
     #[test]
     fn target_parts_do_not_split_modules_after_first_whitespace() {
         let mut parts = Vec::new();
-        push_target_parts(&mut parts, "my_crate::worker span{path=other::module}");
+        renderer().push_target_parts(&mut parts, "my_crate::worker span{path=other::module}");
 
-        let text: String = parts.iter().map(|(text, _, _)| text.as_str()).collect();
+        let text = EntryRenderer::plain_text_from_parts(&parts);
         assert_eq!(text, "my_crate::worker span{path=other::module}: ");
         assert_eq!(
             parts[3],
-            (
+            Part::new(
                 " span{path=other::module}".to_string(),
                 Color::DarkGrey,
                 false
@@ -1069,22 +1195,22 @@ mod tests {
     #[test]
     fn message_parts_highlight_quoted_strings() {
         let mut parts = Vec::new();
-        push_message_parts(&mut parts, "loaded \"user 42\" from cache", Color::White);
+        renderer().push_message_parts(&mut parts, "loaded \"user 42\" from cache", Color::White);
 
-        assert_eq!(parts[0], ("loaded ".to_string(), Color::White, false));
-        assert_eq!(parts[1], ("\"user 42\"".to_string(), string_color(), false));
-        assert_eq!(parts[2], (" from cache".to_string(), Color::White, false));
+        assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
+        assert_eq!(parts[1], Part::new("\"user 42\"", string_color(), false));
+        assert_eq!(parts[2], Part::new(" from cache", Color::White, false));
     }
 
     #[test]
     fn message_parts_keep_escaped_quotes_inside_string() {
         let mut parts = Vec::new();
-        push_message_parts(&mut parts, "loaded \"user \\\"jonas\\\"\"", Color::White);
+        renderer().push_message_parts(&mut parts, "loaded \"user \\\"jonas\\\"\"", Color::White);
 
-        assert_eq!(parts[0], ("loaded ".to_string(), Color::White, false));
+        assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
         assert_eq!(
             parts[1],
-            ("\"user \\\"jonas\\\"\"".to_string(), string_color(), false)
+            Part::new("\"user \\\"jonas\\\"\"", string_color(), false)
         );
     }
 
@@ -1096,23 +1222,20 @@ mod tests {
         ];
         let mut parts = Vec::new();
 
-        push_span_parts(&mut parts, &spans);
+        renderer().push_span_parts(&mut parts, &spans);
 
         assert_eq!(
             parts[0],
-            ("request".to_string(), span_name_color("request"), false)
+            Part::new("request", span_name_color("request"), false)
         );
-        assert_eq!(parts[1], ("{".to_string(), span_punctuation_color(), false));
-        assert_eq!(parts[2], ("id".to_string(), span_key_color(), false));
-        assert_eq!(parts[3], ("=".to_string(), span_punctuation_color(), false));
-        assert_eq!(parts[4], ("7".to_string(), span_value_color("7"), false));
-        assert_eq!(parts[6], (": ".to_string(), Color::DarkGrey, false));
-        assert_eq!(parts[7], ("db".to_string(), span_name_color("db"), false));
-        assert_eq!(
-            parts[10],
-            ("=".to_string(), span_punctuation_color(), false)
-        );
-        assert_eq!(parts[11], ("\"select\"".to_string(), string_color(), false));
+        assert_eq!(parts[1], Part::new("{", span_punctuation_color(), false));
+        assert_eq!(parts[2], Part::new("id", span_key_color(), false));
+        assert_eq!(parts[3], Part::new("=", span_punctuation_color(), false));
+        assert_eq!(parts[4], Part::new("7", span_value_color("7"), false));
+        assert_eq!(parts[6], Part::new(": ", Color::DarkGrey, false));
+        assert_eq!(parts[7], Part::new("db", span_name_color("db"), false));
+        assert_eq!(parts[10], Part::new("=", span_punctuation_color(), false));
+        assert_eq!(parts[11], Part::new("\"select\"", string_color(), false));
     }
 
     #[test]
@@ -1120,20 +1243,20 @@ mod tests {
         let spans = vec!["load_graphs".to_string(), "load_graphs_inner".to_string()];
         let mut parts = Vec::new();
 
-        push_span_parts(&mut parts, &spans);
+        renderer().push_span_parts(&mut parts, &spans);
 
         assert_eq!(
             parts[0],
-            (
+            Part::new(
                 "load_graphs".to_string(),
                 span_name_color("load_graphs"),
                 false
             )
         );
-        assert_eq!(parts[1], (": ".to_string(), Color::DarkGrey, false));
+        assert_eq!(parts[1], Part::new(": ", Color::DarkGrey, false));
         assert_eq!(
             parts[2],
-            (
+            Part::new(
                 "load_graphs_inner".to_string(),
                 span_name_color("load_graphs_inner"),
                 false

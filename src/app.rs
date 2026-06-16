@@ -40,7 +40,7 @@ fn event_loop(
     max_lines: Option<usize>,
 ) -> Result<()> {
     let mut entries = VecDeque::new();
-    let mut state = ViewState::default();
+    let mut state = ViewState::new();
     let mut exit_status = None;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
