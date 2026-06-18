@@ -1,9 +1,6 @@
 use crate::{
     cli::LogFormat,
-    model::{
-        Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField,
-        TraceValueSection,
-    },
+    model::{Level, LogEntry, MessagePart, Stream, TraceValue, TraceValueField, TraceValueSection},
 };
 use serde_json::{Map, Value};
 
@@ -203,21 +200,19 @@ fn bunyan_message_parts(message: &str, fields: &Map<String, Value>) -> Vec<Messa
         .filter(|(key, _)| !BUNYAN_CORE_FIELDS.contains(&key.as_str()))
         .collect();
 
-    let mut parts = vec![MessagePart::new(message, MessageStyle::Default)];
+    let mut parts = vec![MessagePart::text(message)];
     if extras.is_empty() {
         return parts;
     }
 
-    parts.push(MessagePart::new(" (", MessageStyle::JsonPunctuation));
-    for (idx, (key, value)) in extras.iter().enumerate() {
-        if idx > 0 {
-            parts.push(MessagePart::new(" ", MessageStyle::JsonPunctuation));
-        }
-        parts.push(MessagePart::new(*key, MessageStyle::JsonKey));
-        parts.push(MessagePart::new("=", MessageStyle::JsonPunctuation));
-        push_json_value_parts(&mut parts, value);
-    }
-    parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
+    parts.push(MessagePart::fields(
+        extras
+            .into_iter()
+            .map(|(key, value)| {
+                TraceValueField::new(key.clone(), TraceValue::from_json(value.clone()))
+            })
+            .collect(),
+    ));
     parts
 }
 
@@ -229,33 +224,18 @@ struct TracingField {
 
 fn tracing_message_parts(message: &str) -> (Vec<MessagePart>, Vec<TraceValueField>) {
     let Some((message, fields)) = split_tracing_message_fields(message) else {
-        return (
-            vec![MessagePart::new(message, MessageStyle::Default)],
-            Vec::new(),
-        );
+        return (vec![MessagePart::text(message)], Vec::new());
     };
 
     let mut parts = Vec::new();
     if !message.is_empty() {
-        parts.push(MessagePart::new(message, MessageStyle::Default));
-        parts.push(MessagePart::new(" (", MessageStyle::JsonPunctuation));
-    } else {
-        parts.push(MessagePart::new("(", MessageStyle::JsonPunctuation));
+        parts.push(MessagePart::text(message));
     }
-
-    for (idx, field) in fields.iter().enumerate() {
-        if idx > 0 {
-            parts.push(MessagePart::new(" ", MessageStyle::JsonPunctuation));
-        }
-        parts.push(MessagePart::new(&field.key, MessageStyle::JsonKey));
-        parts.push(MessagePart::new("=", MessageStyle::JsonPunctuation));
-        push_tracing_value_part(&mut parts, &field.value);
-    }
-    parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
     let values = fields
         .into_iter()
         .map(|field| TraceValueField::new(field.key, field.value))
-        .collect();
+        .collect::<Vec<_>>();
+    parts.push(MessagePart::fields(values.clone()));
     (parts, values)
 }
 
@@ -495,62 +475,6 @@ fn quoted_value_end(value: &str) -> Option<usize> {
     }
 
     None
-}
-
-fn push_tracing_value_part(parts: &mut Vec<MessagePart>, value: &TraceValue) {
-    let style = match value {
-        TraceValue::Bool(_) => MessageStyle::JsonBool,
-        TraceValue::Null(_) => MessageStyle::JsonNull,
-        TraceValue::Number(_) => MessageStyle::JsonNumber,
-        TraceValue::String(_) => MessageStyle::JsonString,
-        TraceValue::Object(_) => MessageStyle::JsonObject,
-        TraceValue::Array(_) => MessageStyle::JsonArray,
-        TraceValue::Other(_) => MessageStyle::Default,
-    };
-
-    parts.push(MessagePart::new(value.text(), style));
-}
-
-fn push_json_value_parts(parts: &mut Vec<MessagePart>, value: &Value) {
-    match value {
-        Value::Null => parts.push(MessagePart::new("null", MessageStyle::JsonNull)),
-        Value::Bool(value) => {
-            parts.push(MessagePart::new(value.to_string(), MessageStyle::JsonBool))
-        }
-        Value::Number(value) => parts.push(MessagePart::new(
-            value.to_string(),
-            MessageStyle::JsonNumber,
-        )),
-        Value::String(value) => parts.push(MessagePart::new(
-            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
-            MessageStyle::JsonString,
-        )),
-        Value::Array(values) => {
-            parts.push(MessagePart::new("[", MessageStyle::JsonArray));
-            for (idx, value) in values.iter().enumerate() {
-                if idx > 0 {
-                    parts.push(MessagePart::new(",", MessageStyle::JsonPunctuation));
-                }
-                push_json_value_parts(parts, value);
-            }
-            parts.push(MessagePart::new("]", MessageStyle::JsonArray));
-        }
-        Value::Object(fields) => {
-            parts.push(MessagePart::new("{", MessageStyle::JsonObject));
-            for (idx, (key, value)) in fields.iter().enumerate() {
-                if idx > 0 {
-                    parts.push(MessagePart::new(",", MessageStyle::JsonPunctuation));
-                }
-                parts.push(MessagePart::new(
-                    serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
-                    MessageStyle::JsonKey,
-                ));
-                parts.push(MessagePart::new(":", MessageStyle::JsonPunctuation));
-                push_json_value_parts(parts, value);
-            }
-            parts.push(MessagePart::new("}", MessageStyle::JsonObject));
-        }
-    }
 }
 
 fn take_token(value: &str) -> Option<(&str, &str)> {
@@ -876,24 +800,16 @@ mod tests {
         assert_eq!(
             entry.message_parts,
             vec![
-                MessagePart::new("loaded user", MessageStyle::Default),
-                MessagePart::new(" (", MessageStyle::JsonPunctuation),
-                MessagePart::new("id", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("7", MessageStyle::JsonNumber),
-                MessagePart::new(" ", MessageStyle::JsonPunctuation),
-                MessagePart::new("ok", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("true", MessageStyle::JsonBool),
-                MessagePart::new(" ", MessageStyle::JsonPunctuation),
-                MessagePart::new("tag", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("\"admin\"", MessageStyle::JsonString),
-                MessagePart::new(" ", MessageStyle::JsonPunctuation),
-                MessagePart::new("error.sources", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("[out of space, out of cash]", MessageStyle::JsonArray),
-                MessagePart::new(")", MessageStyle::JsonPunctuation),
+                MessagePart::text("loaded user"),
+                MessagePart::fields(vec![
+                    TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
+                    TraceValueField::new("tag", TraceValue::String("admin".to_string())),
+                    TraceValueField::new(
+                        "error.sources",
+                        TraceValue::Other("[out of space, out of cash]".to_string())
+                    ),
+                ]),
             ]
         );
         assert_eq!(
@@ -902,11 +818,11 @@ mod tests {
                 "event",
                 vec![
                     TraceValueField::new("id", TraceValue::Number("7".to_string())),
-                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
-                    TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
+                    TraceValueField::new("tag", TraceValue::String("admin".to_string())),
                     TraceValueField::new(
                         "error.sources",
-                        TraceValue::Array("[out of space, out of cash]".to_string())
+                        TraceValue::Other("[out of space, out of cash]".to_string())
                     ),
                 ]
             )]
@@ -925,7 +841,7 @@ mod tests {
                 "scope: request",
                 vec![
                     TraceValueField::new("id", TraceValue::Number("7".to_string())),
-                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
                 ]
             )]
         );
@@ -943,7 +859,7 @@ mod tests {
                 "scope: request",
                 vec![
                     TraceValueField::new("id", TraceValue::Number("7".to_string())),
-                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
                 ]
             )]
         );
@@ -957,10 +873,7 @@ mod tests {
         assert_eq!(entry.message, "user typed mode=debug yesterday");
         assert_eq!(
             entry.message_parts,
-            vec![MessagePart::new(
-                "user typed mode=debug yesterday",
-                MessageStyle::Default
-            )]
+            vec![MessagePart::text("user typed mode=debug yesterday")]
         );
     }
 
@@ -978,10 +891,7 @@ mod tests {
         assert_eq!(entry.target.as_deref(), Some("myapp"));
         assert_eq!(entry.message, "hi");
         assert_eq!(entry.stream, Stream::Stdout);
-        assert_eq!(
-            entry.message_parts,
-            vec![MessagePart::new("hi", MessageStyle::Default)]
-        );
+        assert_eq!(entry.message_parts, vec![MessagePart::text("hi")]);
     }
 
     #[test]
@@ -998,20 +908,12 @@ mod tests {
         assert_eq!(
             entry.message_parts,
             vec![
-                MessagePart::new("au revoir", MessageStyle::Default),
-                MessagePart::new(" (", MessageStyle::JsonPunctuation),
-                MessagePart::new("lang", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("\"fr\"", MessageStyle::JsonString),
-                MessagePart::new(" ", MessageStyle::JsonPunctuation),
-                MessagePart::new("ok", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("true", MessageStyle::JsonBool),
-                MessagePart::new(" ", MessageStyle::JsonPunctuation),
-                MessagePart::new("count", MessageStyle::JsonKey),
-                MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("7", MessageStyle::JsonNumber),
-                MessagePart::new(")", MessageStyle::JsonPunctuation),
+                MessagePart::text("au revoir"),
+                MessagePart::fields(vec![
+                    TraceValueField::new("lang", TraceValue::String("fr".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
+                    TraceValueField::new("count", TraceValue::Number("7".to_string())),
+                ]),
             ]
         );
     }
@@ -1028,23 +930,28 @@ mod tests {
             entry.message,
             r#"request (req={"method":"GET","status":200} tags=["api",null,false])"#
         );
-        assert!(
-            entry
-                .message_parts
-                .iter()
-                .any(|part| part.text == "null" && part.style == MessageStyle::JsonNull)
-        );
-        assert!(
-            entry
-                .message_parts
-                .iter()
-                .any(|part| part.text == "[" && part.style == MessageStyle::JsonArray)
-        );
-        assert!(
-            entry
-                .message_parts
-                .iter()
-                .any(|part| part.text == "{" && part.style == MessageStyle::JsonObject)
+        assert_eq!(
+            entry.message_parts,
+            vec![
+                MessagePart::text("request"),
+                MessagePart::fields(vec![
+                    TraceValueField::new(
+                        "req",
+                        TraceValue::Object(vec![
+                            ("method".to_string(), TraceValue::String("GET".to_string())),
+                            ("status".to_string(), TraceValue::Number("200".to_string())),
+                        ])
+                    ),
+                    TraceValueField::new(
+                        "tags",
+                        TraceValue::Array(vec![
+                            TraceValue::String("api".to_string()),
+                            TraceValue::Null,
+                            TraceValue::Bool(false),
+                        ])
+                    ),
+                ]),
+            ]
         );
     }
 

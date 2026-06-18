@@ -12,9 +12,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 
-use crate::model::{
-    Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField,
-};
+use crate::model::{Level, LogEntry, MessagePart, Stream, TraceValue, TraceValueField};
 
 #[derive(Debug, Default)]
 pub(crate) struct ViewState {
@@ -33,10 +31,17 @@ pub(crate) struct ViewState {
 
 #[derive(Debug, Default)]
 pub(crate) struct ValuesPaneState {
-    pub(crate) visible: bool,
-    pub(crate) fullscreen: bool,
+    pub(crate) mode: ValuesPaneMode,
     pub(crate) selected: Option<usize>,
     pub(crate) x_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ValuesPaneMode {
+    #[default]
+    Closed,
+    Sidebar,
+    Fullscreen,
 }
 
 impl ViewState {
@@ -206,7 +211,10 @@ fn handle_values_key(
             close_values_pane(state);
         }
         KeyCode::Char('v') => {
-            cycle_values_pane(entries, state);
+            toggle_values_sidebar(entries, state);
+        }
+        KeyCode::Char('V') => {
+            toggle_values_fullscreen(entries, state);
         }
         KeyCode::Char('/') => {
             close_values_pane(state);
@@ -228,26 +236,36 @@ fn handle_values_key(
     KeyAction::Continue
 }
 
-fn open_values_pane(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+fn open_values_sidebar(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
     clear_search(state);
-    state.values.visible = true;
-    state.values.fullscreen = false;
+    state.values.mode = ValuesPaneMode::Sidebar;
     sync_values_selection(entries, state);
 }
 
-fn cycle_values_pane(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    if !state.values.visible {
-        open_values_pane(entries, state);
-    } else if !state.values.fullscreen {
-        state.values.fullscreen = true;
-    } else {
+fn open_values_fullscreen(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    clear_search(state);
+    state.values.mode = ValuesPaneMode::Fullscreen;
+    sync_values_selection(entries, state);
+}
+
+fn toggle_values_sidebar(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    if state.values.mode == ValuesPaneMode::Sidebar {
         close_values_pane(state);
+    } else {
+        open_values_sidebar(entries, state);
+    }
+}
+
+fn toggle_values_fullscreen(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    if state.values.mode == ValuesPaneMode::Fullscreen {
+        close_values_pane(state);
+    } else {
+        open_values_fullscreen(entries, state);
     }
 }
 
 fn close_values_pane(state: &mut ViewState) {
-    state.values.visible = false;
-    state.values.fullscreen = false;
+    state.values.mode = ValuesPaneMode::Closed;
     state.values.selected = None;
     state.values.x_offset = 0;
 }
@@ -299,7 +317,7 @@ fn handle_normal_key(
     let page_step = cmp::max(1, page_size.saturating_sub(1));
     const HORIZONTAL_SCROLL_STEP: usize = 16;
 
-    if state.values.visible {
+    if state.values.mode != ValuesPaneMode::Closed {
         return handle_values_key(key, entries, state);
     }
 
@@ -331,7 +349,11 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('v') => {
-            cycle_values_pane(entries, state);
+            toggle_values_sidebar(entries, state);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('V') => {
+            toggle_values_fullscreen(entries, state);
             return KeyAction::Continue;
         }
         KeyCode::Char('f') => {
@@ -410,7 +432,7 @@ pub(crate) fn draw(
     let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
     let pane_width = values_pane_width(cols as usize, &state.values);
     let pane_gap = usize::from(pane_width > 0);
-    let log_width = if state.values.fullscreen {
+    let log_width = if state.values.mode == ValuesPaneMode::Fullscreen {
         0
     } else {
         (cols as usize)
@@ -440,7 +462,7 @@ pub(crate) fn draw(
         draw_search_bar(stdout, entries, state, cols as usize)?;
     }
 
-    if !state.values.fullscreen {
+    if state.values.mode != ValuesPaneMode::Fullscreen {
         for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
             let Some(entry) = entries.get(idx) else {
                 continue;
@@ -456,7 +478,7 @@ pub(crate) fn draw(
         }
     }
 
-    if scrollbar_width > 0 && !state.values.fullscreen {
+    if scrollbar_width > 0 && state.values.mode != ValuesPaneMode::Fullscreen {
         draw_scrollbar(
             stdout,
             entries,
@@ -475,7 +497,7 @@ pub(crate) fn draw(
     }
 
     if pane_width > 0 {
-        let pane_left = if state.values.fullscreen {
+        let pane_left = if state.values.mode == ValuesPaneMode::Fullscreen {
             0
         } else {
             cols as usize - pane_width
@@ -636,7 +658,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  r               toggle raw log line display",
-        "  v               open tracing values pane, or toggle pane fullscreen",
+        "  v / V           toggle tracing values pane or fullscreen",
         "  /               search raw log lines",
         "  n / b           jump to next or previous search result",
         "  Esc             clear search, close help, or close values pane",
@@ -672,7 +694,7 @@ pub(crate) fn selected_line_text(
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
 ) -> Option<String> {
-    if state.values.visible {
+    if state.values.mode != ValuesPaneMode::Closed {
         return selected_value_text(entries, state);
     }
 
@@ -685,7 +707,7 @@ fn selected_value_text(entries: &VecDeque<LogEntry>, state: &ViewState) -> Optio
     let entry = selected_entry_for_values(entries, state)?;
     let selected = state.values.selected?;
     let value = nth_value_field(entry, selected)?;
-    Some(format!("{} = {}", value.key, value.value.text()))
+    Some(format!("{} = {}", value.key, value.value.render_text()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -697,16 +719,11 @@ struct PaneViewport {
 }
 
 fn values_pane_width(cols: usize, state: &ValuesPaneState) -> usize {
-    if !state.visible {
-        return 0;
-    }
-
-    if state.fullscreen {
-        cols
-    } else if cols < 60 {
-        0
-    } else {
-        (cols / 3).clamp(24, 42)
+    match state.mode {
+        ValuesPaneMode::Closed => 0,
+        ValuesPaneMode::Fullscreen => cols,
+        ValuesPaneMode::Sidebar if cols < 60 => 0,
+        ValuesPaneMode::Sidebar => (cols / 3).clamp(24, 42),
     }
 }
 
@@ -747,7 +764,7 @@ fn draw_values_pane(
                     print_value_row(
                         stdout,
                         &field.key,
-                        field.value.text(),
+                        &field.value.render_text(),
                         trace_value_color(&field.value),
                         state.x_offset,
                         text_width,
@@ -918,7 +935,7 @@ fn trace_value_color(value: &TraceValue) -> Color {
     match value {
         TraceValue::Bool(_) | TraceValue::Number(_) => Color::Reset,
         TraceValue::String(_) => Color::Green,
-        TraceValue::Null(_) => Color::DarkGrey,
+        TraceValue::Null => Color::DarkGrey,
         TraceValue::Object(_) | TraceValue::Array(_) => Color::Reset,
         TraceValue::Other(_) => Color::White,
     }
@@ -1407,9 +1424,12 @@ impl EntryRenderer {
         base_color: Color,
     ) {
         if !message_parts.is_empty() {
+            let mut rendered_text = false;
             for part in message_parts {
-                let (color, bold) = message_part_style(part.style, base_color);
-                parts.push(Part::new(&part.text, color, bold));
+                self.push_message_part(parts, part, base_color, rendered_text);
+                if matches!(part, MessagePart::Text(_)) {
+                    rendered_text = true;
+                }
             }
             return;
         }
@@ -1456,6 +1476,85 @@ impl EntryRenderer {
                 base_color
             };
             parts.push(Part::new(current, color, false));
+        }
+    }
+
+    fn push_message_part(
+        &self,
+        parts: &mut Vec<Part>,
+        part: &MessagePart,
+        base_color: Color,
+        after_text: bool,
+    ) {
+        match part {
+            MessagePart::Text(text) => parts.push(Part::new(text, base_color, false)),
+            MessagePart::Fields(fields) => {
+                parts.push(Part::new(
+                    if after_text { " (" } else { "(" },
+                    Color::DarkGrey,
+                    false,
+                ));
+                self.push_trace_fields(parts, fields, " ");
+                parts.push(Part::new(")", Color::DarkGrey, false));
+            }
+        }
+    }
+
+    fn push_trace_fields(
+        &self,
+        parts: &mut Vec<Part>,
+        fields: &[TraceValueField],
+        separator: &str,
+    ) {
+        for (idx, field) in fields.iter().enumerate() {
+            if idx > 0 {
+                parts.push(Part::new(separator, Color::DarkGrey, false));
+            }
+            parts.push(Part::new(&field.key, Color::Blue, true));
+            parts.push(Part::new("=", Color::DarkGrey, false));
+            self.push_trace_value(parts, &field.value);
+        }
+    }
+
+    fn push_trace_value(&self, parts: &mut Vec<Part>, value: &TraceValue) {
+        match value {
+            TraceValue::Bool(value) => {
+                parts.push(Part::new(value.to_string(), Color::Reset, false))
+            }
+            TraceValue::Null => parts.push(Part::new("null", Color::DarkGrey, false)),
+            TraceValue::Number(value) => parts.push(Part::new(value, Color::Reset, false)),
+            TraceValue::String(value) => parts.push(Part::new(
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
+                Color::Green,
+                false,
+            )),
+            TraceValue::Other(value) => parts.push(Part::new(value, Color::White, false)),
+            TraceValue::Array(values) => {
+                parts.push(Part::new("[", Color::Reset, true));
+                for (idx, value) in values.iter().enumerate() {
+                    if idx > 0 {
+                        parts.push(Part::new(",", Color::DarkGrey, false));
+                    }
+                    self.push_trace_value(parts, value);
+                }
+                parts.push(Part::new("]", Color::Reset, true));
+            }
+            TraceValue::Object(fields) => {
+                parts.push(Part::new("{", Color::Reset, true));
+                for (idx, (key, value)) in fields.iter().enumerate() {
+                    if idx > 0 {
+                        parts.push(Part::new(",", Color::DarkGrey, false));
+                    }
+                    parts.push(Part::new(
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                        Color::Blue,
+                        true,
+                    ));
+                    parts.push(Part::new(":", Color::DarkGrey, false));
+                    self.push_trace_value(parts, value);
+                }
+                parts.push(Part::new("}", Color::Reset, true));
+            }
         }
     }
 }
@@ -1611,7 +1710,11 @@ fn status_line(
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
-        if state.values.visible { "on" } else { "off" },
+        if state.values.mode != ValuesPaneMode::Closed {
+            "on"
+        } else {
+            "off"
+        },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
@@ -1670,18 +1773,6 @@ fn string_color() -> Color {
         r: 206,
         g: 145,
         b: 120,
-    }
-}
-
-fn message_part_style(style: MessageStyle, base_color: Color) -> (Color, bool) {
-    match style {
-        MessageStyle::Default => (base_color, false),
-        MessageStyle::JsonArray | MessageStyle::JsonObject => (Color::Reset, true),
-        MessageStyle::JsonBool | MessageStyle::JsonNumber => (Color::Reset, false),
-        MessageStyle::JsonKey => (Color::Blue, true),
-        MessageStyle::JsonNull => (Color::DarkGrey, false),
-        MessageStyle::JsonPunctuation => (Color::DarkGrey, false),
-        MessageStyle::JsonString => (Color::Green, false),
     }
 }
 
@@ -2000,30 +2091,37 @@ mod tests {
     }
 
     #[test]
-    fn v_cycles_tracing_values_pane_side_fullscreen_closed() {
+    fn v_toggles_sidebar_and_uppercase_v_toggles_fullscreen() {
         let entries = VecDeque::from([entry_with_values(vec![TraceValueField::new(
             "id",
             TraceValue::Number("7".to_string()),
         )])]);
         let mut state = ViewState::new();
 
-        assert!(!state.values.visible);
+        assert_eq!(state.values.mode, ValuesPaneMode::Closed);
         assert_eq!(
             handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5),
             KeyAction::Continue
         );
-        assert!(state.values.visible);
-        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.mode, ValuesPaneMode::Sidebar);
+        assert_eq!(state.values.selected, Some(0));
+
+        handle_key(key(KeyCode::Char('V')), &entries, &mut state, false, 5);
+        assert_eq!(state.values.mode, ValuesPaneMode::Fullscreen);
+
+        handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
+        assert_eq!(state.values.mode, ValuesPaneMode::Sidebar);
         assert_eq!(state.values.selected, Some(0));
 
         handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
-        assert!(state.values.visible);
-        assert!(state.values.fullscreen);
-
-        handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
-        assert!(!state.values.visible);
-        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.mode, ValuesPaneMode::Closed);
         assert_eq!(state.values.selected, None);
+
+        handle_key(key(KeyCode::Char('V')), &entries, &mut state, false, 5);
+        assert_eq!(state.values.mode, ValuesPaneMode::Fullscreen);
+
+        handle_key(key(KeyCode::Char('V')), &entries, &mut state, false, 5);
+        assert_eq!(state.values.mode, ValuesPaneMode::Closed);
     }
 
     #[test]
@@ -2031,8 +2129,7 @@ mod tests {
         let entries = entries(1);
         let mut state = ViewState {
             values: ValuesPaneState {
-                visible: true,
-                fullscreen: true,
+                mode: ValuesPaneMode::Fullscreen,
                 selected: Some(0),
                 x_offset: 16,
             },
@@ -2044,8 +2141,7 @@ mod tests {
             handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5),
             KeyAction::Continue
         );
-        assert!(!state.values.visible);
-        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.mode, ValuesPaneMode::Closed);
         assert_eq!(state.values.selected, None);
         assert_eq!(state.values.x_offset, 0);
         assert_eq!(state.search_query, "line");
@@ -2055,12 +2151,12 @@ mod tests {
     fn arrow_keys_select_and_scroll_values_when_pane_is_open() {
         let entries = VecDeque::from([entry_with_values(vec![
             TraceValueField::new("id", TraceValue::Number("7".to_string())),
-            TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+            TraceValueField::new("tag", TraceValue::String("admin".to_string())),
         ])]);
         let mut state = ViewState {
             selected: Some(0),
             values: ValuesPaneState {
-                visible: true,
+                mode: ValuesPaneMode::Sidebar,
                 ..ValuesPaneState::default()
             },
             ..ViewState::new()
@@ -2085,12 +2181,12 @@ mod tests {
     fn y_copies_selected_value_when_values_pane_is_open() {
         let entries = VecDeque::from([entry_with_values(vec![
             TraceValueField::new("id", TraceValue::Number("7".to_string())),
-            TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+            TraceValueField::new("tag", TraceValue::String("admin".to_string())),
         ])]);
         let mut state = ViewState {
             selected: Some(0),
             values: ValuesPaneState {
-                visible: true,
+                mode: ValuesPaneMode::Sidebar,
                 selected: Some(1),
                 ..ValuesPaneState::default()
             },
@@ -2112,8 +2208,7 @@ mod tests {
         let entries = entries(1);
         let mut state = ViewState {
             values: ValuesPaneState {
-                visible: true,
-                fullscreen: true,
+                mode: ValuesPaneMode::Fullscreen,
                 selected: Some(0),
                 x_offset: 16,
             },
@@ -2122,8 +2217,7 @@ mod tests {
 
         handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
 
-        assert!(!state.values.visible);
-        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.mode, ValuesPaneMode::Closed);
         assert!(state.search_editing);
     }
 
@@ -2141,7 +2235,7 @@ mod tests {
                 "event",
                 vec![TraceValueField::new(
                     "tag",
-                    TraceValue::String("\"admin\"".to_string()),
+                    TraceValue::String("admin".to_string()),
                 )],
             ),
         ]);
@@ -2916,24 +3010,13 @@ mod tests {
     #[test]
     fn structured_message_parts_use_jq_style_colors() {
         let message_parts = vec![
-            MessagePart::new("au revoir", MessageStyle::Default),
-            MessagePart::new(" (", MessageStyle::JsonPunctuation),
-            MessagePart::new("lang", MessageStyle::JsonKey),
-            MessagePart::new("=", MessageStyle::JsonPunctuation),
-            MessagePart::new("\"fr\"", MessageStyle::JsonString),
-            MessagePart::new(" ", MessageStyle::JsonPunctuation),
-            MessagePart::new("ok", MessageStyle::JsonBool),
-            MessagePart::new("=", MessageStyle::JsonPunctuation),
-            MessagePart::new("true", MessageStyle::JsonBool),
-            MessagePart::new(" ", MessageStyle::JsonPunctuation),
-            MessagePart::new("count", MessageStyle::JsonNumber),
-            MessagePart::new("=", MessageStyle::JsonPunctuation),
-            MessagePart::new("7", MessageStyle::JsonNumber),
-            MessagePart::new(" ", MessageStyle::JsonPunctuation),
-            MessagePart::new("none", MessageStyle::JsonNull),
-            MessagePart::new("=", MessageStyle::JsonPunctuation),
-            MessagePart::new("null", MessageStyle::JsonNull),
-            MessagePart::new(")", MessageStyle::JsonPunctuation),
+            MessagePart::text("au revoir"),
+            MessagePart::fields(vec![
+                TraceValueField::new("lang", TraceValue::String("fr".to_string())),
+                TraceValueField::new("ok", TraceValue::Bool(true)),
+                TraceValueField::new("count", TraceValue::Number("7".to_string())),
+                TraceValueField::new("none", TraceValue::Null),
+            ]),
         ];
         let mut parts = Vec::new();
 

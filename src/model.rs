@@ -1,5 +1,7 @@
 use std::process::ExitStatus;
 
+use serde_json::Value;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stream {
     Stdout,
@@ -95,77 +97,119 @@ impl TraceValueField {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TraceValue {
-    Bool(String),
-    Null(String),
+    Bool(bool),
+    Null,
     Number(String),
     String(String),
-    Object(String),
-    Array(String),
+    Object(Vec<(String, TraceValue)>),
+    Array(Vec<TraceValue>),
     Other(String),
 }
 
 impl TraceValue {
     pub(crate) fn from_tracing_text(value: &str) -> Self {
-        let value = value.to_string();
-        if matches!(value.as_str(), "true" | "false") {
-            Self::Bool(value)
-        } else if value == "null" {
-            Self::Null(value)
+        if let Ok(value) = serde_json::from_str(value) {
+            Self::from_json(value)
         } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-            Self::Number(value)
-        } else if value.starts_with('"') && value.ends_with('"') {
-            Self::String(value)
-        } else if value.starts_with('{') && value.ends_with('}') {
-            Self::Object(value)
-        } else if value.starts_with('[') && value.ends_with(']') {
-            Self::Array(value)
+            Self::Number(value.to_string())
         } else {
-            Self::Other(value)
+            Self::Other(value.to_string())
         }
     }
 
-    pub(crate) fn text(&self) -> &str {
+    pub(crate) fn from_json(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(value) => Self::Bool(value),
+            Value::Number(value) => Self::Number(value.to_string()),
+            Value::String(value) => Self::String(value),
+            Value::Array(values) => Self::Array(values.into_iter().map(Self::from_json).collect()),
+            Value::Object(fields) => Self::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from_json(value)))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn render_text(&self) -> String {
         match self {
-            Self::Bool(value)
-            | Self::Null(value)
-            | Self::Number(value)
-            | Self::String(value)
-            | Self::Object(value)
-            | Self::Array(value)
-            | Self::Other(value) => value,
+            Self::Bool(value) => value.to_string(),
+            Self::Null => "null".to_string(),
+            Self::Number(value) | Self::Other(value) => value.clone(),
+            Self::String(value) => {
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+            }
+            Self::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(Self::render_text)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::Object(fields) => format!(
+                "{{{}}}",
+                fields
+                    .iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                            value.render_text()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MessageStyle {
-    Default,
-    JsonArray,
-    JsonBool,
-    JsonKey,
-    JsonNull,
-    JsonNumber,
-    JsonObject,
-    JsonPunctuation,
-    JsonString,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MessagePart {
-    pub(crate) text: String,
-    pub(crate) style: MessageStyle,
+pub(crate) enum MessagePart {
+    Text(String),
+    Fields(Vec<TraceValueField>),
 }
 
 impl MessagePart {
-    pub(crate) fn new(text: impl Into<String>, style: MessageStyle) -> Self {
-        Self {
-            text: text.into(),
-            style,
-        }
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    pub(crate) fn fields(fields: Vec<TraceValueField>) -> Self {
+        Self::Fields(fields)
     }
 
     pub(crate) fn plain_text(parts: &[Self]) -> String {
-        parts.iter().map(|part| part.text.as_str()).collect()
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                Self::Text(part) => text.push_str(part),
+                Self::Fields(fields) => {
+                    if text.is_empty() {
+                        text.push('(');
+                    } else {
+                        text.push_str(" (");
+                    }
+                    push_fields_text(&mut text, fields);
+                    text.push(')');
+                }
+            }
+        }
+        text
+    }
+}
+
+fn push_fields_text(text: &mut String, fields: &[TraceValueField]) {
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            text.push(' ');
+        }
+        text.push_str(&field.key);
+        text.push('=');
+        text.push_str(&field.value.render_text());
     }
 }
 
