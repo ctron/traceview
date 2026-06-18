@@ -31,6 +31,7 @@ The installed binary is named `tv`.
 tv -- cargo test
 tv --format tracing -- my-service
 tv --format bunyan -- node service.js
+tv --format logfmt -- ./service
 tv --max-lines 5000 -- ./run.sh
 ```
 
@@ -41,6 +42,7 @@ Use `--format` to choose one explicitly:
 - `plain`: show lines without parsing
 - `bunyan`: Bunyan JSON records
 - `env-logger`: common `env_logger` text output
+- `logfmt`: key=value records
 - `tracing`: common `tracing` text output
 
 ## Showcase Example
@@ -50,6 +52,7 @@ for each supported parser:
 
 ```sh
 cargo run --example showcase -- env-logger
+cargo run --example showcase -- logfmt
 cargo run --example showcase -- tracing
 cargo run --example showcase -- bunyan
 ```
@@ -58,6 +61,7 @@ Run it through `tv` to inspect the rendering:
 
 ```sh
 cargo run --bin tv -- --format env-logger -- cargo run --example showcase -- env-logger
+cargo run --bin tv -- --format logfmt -- cargo run --example showcase -- logfmt
 cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing
 cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
 ```

@@ -7,6 +7,7 @@ use tracing_subscriber::{filter::LevelFilter, prelude::*, registry::Registry};
 enum Format {
     Plain,
     EnvLogger,
+    Logfmt,
     Tracing,
     Bunyan,
 }
@@ -16,6 +17,7 @@ impl Format {
         match value {
             "plain" => Some(Self::Plain),
             "env-logger" | "env_logger" => Some(Self::EnvLogger),
+            "logfmt" => Some(Self::Logfmt),
             "tracing" => Some(Self::Tracing),
             "bunyan" => Some(Self::Bunyan),
             _ => None,
@@ -42,6 +44,7 @@ fn main() {
             init_env_logger();
             emit_log_records(repeat);
         }
+        Format::Logfmt => emit_logfmt(repeat),
         Format::Tracing => {
             init_tracing_fmt();
             emit_tracing_records(repeat);
@@ -128,6 +131,25 @@ fn emit_log_records(repeat: usize) {
     }
 }
 
+fn emit_logfmt(repeat: usize) {
+    for pass in 0..repeat {
+        println!(
+            "time=2026-06-15T12:01:02Z level=info target=showcase::server msg=\"starting http listener\" addr=127.0.0.1:8080 workers=4 pass={} cold_start={}",
+            pass + 1,
+            pass == 0
+        );
+        println!(
+            "time=2026-06-15T12:01:03Z level=debug target=showcase::handler msg=\"loaded widgets\" count=12 cached=false user_id=42 latency_ms=18.4"
+        );
+        println!(
+            "time=2026-06-15T12:01:04Z level=warn target=showcase::client msg=\"retrying upstream\" attempt=2 reason=\"rate limited\" retry_after_ms=250"
+        );
+        println!(
+            "time=2026-06-15T12:01:05Z level=error target=showcase::worker msg=\"failed to process job\" error=\"missing artifact\" job_id=019b9370-0a9d-7231-825b-3f6f3b80555a"
+        );
+    }
+}
+
 fn emit_tracing_records(repeat: usize) {
     for pass in 0..repeat {
         tracing::info!(
@@ -137,7 +159,7 @@ fn emit_tracing_records(repeat: usize) {
             pass = pass + 1,
             cold_start = pass == 0,
             build.version = "0.1.2",
-            features = ?["plain", "env-logger", "tracing", "bunyan"],
+            features = ?["plain", "env-logger", "logfmt", "tracing", "bunyan"],
             "starting http listener"
         );
 
@@ -211,12 +233,14 @@ fn print_help() {
 traceviewer showcase example
 
 Usage:
-  cargo run --example showcase -- <plain|env-logger|tracing|bunyan> [--repeat N]
+  cargo run --example showcase -- <plain|env-logger|logfmt|tracing|bunyan> [--repeat N]
 
 Examples:
   cargo run --example showcase -- tracing
+  cargo run --example showcase -- logfmt
   cargo run --example showcase -- bunyan
   cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing
+  cargo run --bin tv -- --format logfmt -- cargo run --example showcase -- logfmt
   cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
   cargo run --bin tv -- --format env-logger -- cargo run --example showcase -- env-logger
 "

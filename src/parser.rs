@@ -11,10 +11,12 @@ pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> 
     let parsed = match format {
         LogFormat::Auto => parse_bunyan(&raw, stream)
             .or_else(|| parse_tracing(&raw))
+            .or_else(|| parse_logfmt(&raw, stream))
             .or_else(|| parse_env_logger(&raw)),
         LogFormat::Bunyan => parse_bunyan(&raw, stream),
         LogFormat::Plain => None,
         LogFormat::EnvLogger => parse_env_logger(&raw),
+        LogFormat::Logfmt => parse_logfmt(&raw, stream),
         LogFormat::Tracing => parse_tracing(&raw),
     };
 
@@ -110,6 +112,153 @@ fn parse_env_logger(raw: &str) -> Option<LogEntry> {
         message_parts: Vec::new(),
         stream: Stream::Stdout,
     })
+}
+
+fn parse_logfmt(raw: &str, stream: Stream) -> Option<LogEntry> {
+    let raw = raw.trim_end();
+    let fields = parse_logfmt_fields(raw)?;
+    if fields.is_empty() {
+        return None;
+    }
+
+    let level = fields
+        .iter()
+        .find(|field| field.key == "level" || field.key == "lvl")
+        .and_then(|field| parse_level(&logfmt_core_text(&field.value)))
+        .unwrap_or(Level::Unknown);
+    let timestamp = fields
+        .iter()
+        .find(|field| matches!(field.key.as_str(), "time" | "timestamp" | "ts"))
+        .map(|field| logfmt_core_text(&field.value));
+    let target = fields
+        .iter()
+        .find(|field| matches!(field.key.as_str(), "target" | "logger" | "module"))
+        .map(|field| logfmt_core_text(&field.value));
+    let message = fields
+        .iter()
+        .find(|field| matches!(field.key.as_str(), "msg" | "message"))
+        .map(|field| logfmt_core_text(&field.value))
+        .unwrap_or_default();
+    let values: Vec<_> = fields
+        .iter()
+        .filter(|field| !LOGFMT_CORE_FIELDS.contains(&field.key.as_str()))
+        .cloned()
+        .collect();
+    let message_parts = if values.is_empty() {
+        if message.is_empty() {
+            Vec::new()
+        } else {
+            vec![MessagePart::text(&message)]
+        }
+    } else {
+        let mut parts = Vec::new();
+        if !message.is_empty() {
+            parts.push(MessagePart::text(&message));
+        }
+        parts.push(MessagePart::fields(values.clone()));
+        parts
+    };
+    let message = MessagePart::plain_text(&message_parts);
+    let values = if values.is_empty() {
+        Vec::new()
+    } else {
+        vec![TraceValueSection::new("event", values)]
+    };
+
+    Some(LogEntry {
+        raw: raw.to_string(),
+        timestamp,
+        level,
+        parsed: true,
+        target,
+        spans: Vec::new(),
+        values,
+        message,
+        message_parts,
+        stream,
+    })
+}
+
+const LOGFMT_CORE_FIELDS: &[&str] = &[
+    "level",
+    "lvl",
+    "msg",
+    "message",
+    "time",
+    "timestamp",
+    "ts",
+    "target",
+    "logger",
+    "module",
+];
+
+fn logfmt_core_text(value: &TraceValue) -> String {
+    match value {
+        TraceValue::String(value) => value.clone(),
+        value => value.render_text(),
+    }
+}
+
+fn parse_logfmt_fields(input: &str) -> Option<Vec<TraceValueField>> {
+    let mut fields = Vec::new();
+    let mut rest = input.trim_start();
+
+    while !rest.is_empty() {
+        let (key, after_key) = take_logfmt_key(rest)?;
+        let after_eq = after_key.strip_prefix('=')?;
+        let (value, tail) = take_logfmt_value(after_eq)?;
+        fields.push(TraceValueField::new(
+            key,
+            TraceValue::from_tracing_text(&value),
+        ));
+        rest = tail.trim_start();
+    }
+
+    Some(fields)
+}
+
+fn take_logfmt_key(input: &str) -> Option<(&str, &str)> {
+    let end = input.find('=')?;
+    let key = &input[..end];
+    if key.is_empty()
+        || key
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '='))
+    {
+        return None;
+    }
+    Some((key, &input[end..]))
+}
+
+fn take_logfmt_value(input: &str) -> Option<(String, &str)> {
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut value = String::new();
+        let mut escaped = false;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                value.push(match ch {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                return Some((
+                    serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string()),
+                    &rest[idx + ch.len_utf8()..],
+                ));
+            } else {
+                value.push(ch);
+            }
+        }
+        return None;
+    }
+
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some((input[..end].to_string(), &input[end..]))
 }
 
 fn parse_tracing(raw: &str) -> Option<LogEntry> {
@@ -634,6 +783,81 @@ mod tests {
         assert_eq!(entry.timestamp.as_deref(), Some("2026-06-15T12:01:02Z"));
         assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
         assert_eq!(entry.message, "finished job 42");
+    }
+
+    #[test]
+    fn parses_logfmt_default_shape() {
+        let entry = parse_logfmt(
+            r#"time=2026-06-15T12:01:02Z level=info target=my_crate::worker msg="loaded user" user=alice count=7 ok=true"#,
+            Stream::Stdout,
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert!(entry.parsed);
+        assert_eq!(entry.timestamp.as_deref(), Some("2026-06-15T12:01:02Z"));
+        assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
+        assert_eq!(entry.message, r#"loaded user (user=alice count=7 ok=true)"#);
+        assert_eq!(
+            entry.message_parts,
+            vec![
+                MessagePart::text("loaded user"),
+                MessagePart::fields(vec![
+                    TraceValueField::new("user", TraceValue::Other("alice".to_string())),
+                    TraceValueField::new("count", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
+                ]),
+            ]
+        );
+        assert_eq!(
+            entry.values,
+            vec![TraceValueSection::new(
+                "event",
+                vec![
+                    TraceValueField::new("user", TraceValue::Other("alice".to_string())),
+                    TraceValueField::new("count", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool(true)),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_logfmt_quoted_escapes() {
+        let entry = parse_logfmt(
+            r#"level=warn msg="retry \"soon\"" path="/api widgets""#,
+            Stream::Stderr,
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Warn);
+        assert_eq!(entry.stream, Stream::Stderr);
+        assert_eq!(entry.message, r#"retry "soon" (path="/api widgets")"#);
+    }
+
+    #[test]
+    fn invalid_logfmt_falls_back_to_unparsed_entry() {
+        let entry = parse_log_line(
+            LogFormat::Logfmt,
+            Stream::Stdout,
+            "not a logfmt line".to_string(),
+        );
+
+        assert!(!entry.parsed);
+        assert_eq!(entry.message, "not a logfmt line");
+    }
+
+    #[test]
+    fn auto_detects_logfmt() {
+        let entry = parse_log_line(
+            LogFormat::Auto,
+            Stream::Stdout,
+            r#"level=info msg="hello" count=2"#.to_string(),
+        );
+
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.message, "hello (count=2)");
     }
 
     #[test]
