@@ -1,6 +1,9 @@
 use crate::{
     cli::LogFormat,
-    model::{Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField},
+    model::{
+        Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField,
+        TraceValueSection,
+    },
 };
 use serde_json::{Map, Value};
 
@@ -124,9 +127,11 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
     };
 
     let (target, spans, message) = split_tracing_target_message(rest);
-    let mut values = span_value_fields(&spans);
+    let mut values = span_value_sections(&spans);
     let (message_parts, message_values) = tracing_message_parts(&message);
-    values.extend(message_values);
+    if !message_values.is_empty() {
+        values.push(TraceValueSection::new("event", message_values));
+    }
     let message = MessagePart::plain_text(&message_parts);
 
     Some(LogEntry {
@@ -254,23 +259,40 @@ fn tracing_message_parts(message: &str) -> (Vec<MessagePart>, Vec<TraceValueFiel
     (parts, values)
 }
 
-fn span_value_fields(spans: &[String]) -> Vec<TraceValueField> {
+fn span_value_sections(spans: &[String]) -> Vec<TraceValueSection> {
     spans
         .iter()
-        .flat_map(|span| {
-            let Some(open) = span.find('{') else {
-                return Vec::new();
-            };
+        .filter_map(|span| {
+            let open = span.find('{')?;
             if !span.ends_with('}') {
-                return Vec::new();
+                return None;
             }
 
-            split_top_level(&span[open + 1..span.len() - 1], ',')
+            let fields: Vec<_> = split_top_level(&span[open + 1..span.len() - 1], ',')
                 .into_iter()
-                .filter_map(parse_span_value_field)
-                .collect()
+                .flat_map(span_segment_value_fields)
+                .collect();
+            if fields.is_empty() {
+                return None;
+            }
+
+            Some(TraceValueSection::new(
+                format!("scope: {}", span[..open].trim()),
+                fields,
+            ))
         })
         .collect()
+}
+
+fn span_segment_value_fields(segment: &str) -> Vec<TraceValueField> {
+    if let Some(fields) = parse_tracing_field_sequence(segment) {
+        return fields
+            .into_iter()
+            .map(|field| TraceValueField::new(field.key, field.value))
+            .collect();
+    }
+
+    parse_span_value_field(segment).into_iter().collect()
 }
 
 fn parse_span_value_field(field: &str) -> Option<TraceValueField> {
@@ -876,15 +898,18 @@ mod tests {
         );
         assert_eq!(
             entry.values,
-            vec![
-                TraceValueField::new("id", TraceValue::Number("7".to_string())),
-                TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
-                TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
-                TraceValueField::new(
-                    "error.sources",
-                    TraceValue::Array("[out of space, out of cash]".to_string())
-                ),
-            ]
+            vec![TraceValueSection::new(
+                "event",
+                vec![
+                    TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                    TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+                    TraceValueField::new(
+                        "error.sources",
+                        TraceValue::Array("[out of space, out of cash]".to_string())
+                    ),
+                ]
+            )]
         );
     }
 
@@ -896,10 +921,31 @@ mod tests {
 
         assert_eq!(
             entry.values,
-            vec![
-                TraceValueField::new("id", TraceValue::Number("7".to_string())),
-                TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
-            ]
+            vec![TraceValueSection::new(
+                "scope: request",
+                vec![
+                    TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_whitespace_separated_tracing_span_fields_as_separate_values() {
+        let entry =
+            parse_tracing("2026-06-15T12:01:02Z INFO request{id=7 ok=true}: svc: loaded user")
+                .expect("entry");
+
+        assert_eq!(
+            entry.values,
+            vec![TraceValueSection::new(
+                "scope: request",
+                vec![
+                    TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                    TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                ]
+            )]
         );
     }
 

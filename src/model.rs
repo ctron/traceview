@@ -57,10 +57,25 @@ pub(crate) struct LogEntry {
     pub(crate) parsed: bool,
     pub(crate) target: Option<String>,
     pub(crate) spans: Vec<String>,
-    pub(crate) values: Vec<TraceValueField>,
+    pub(crate) values: Vec<TraceValueSection>,
     pub(crate) message: String,
     pub(crate) message_parts: Vec<MessagePart>,
     pub(crate) stream: Stream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TraceValueSection {
+    pub(crate) title: String,
+    pub(crate) fields: Vec<TraceValueField>,
+}
+
+impl TraceValueSection {
+    pub(crate) fn new(title: impl Into<String>, fields: Vec<TraceValueField>) -> Self {
+        Self {
+            title: title.into(),
+            fields,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

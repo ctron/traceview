@@ -12,7 +12,9 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 
-use crate::model::{Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue};
+use crate::model::{
+    Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct ViewState {
@@ -20,13 +22,21 @@ pub(crate) struct ViewState {
     pub(crate) first_visible: usize,
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
-    pub(crate) values_visible: bool,
+    pub(crate) values: ValuesPaneState,
     pub(crate) show_spans: bool,
     pub(crate) show_raw: bool,
     pub(crate) search_query: String,
     pub(crate) search_editing: bool,
     pub(crate) search_wrapped: bool,
     pub(crate) focus_target: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ValuesPaneState {
+    pub(crate) visible: bool,
+    pub(crate) fullscreen: bool,
+    pub(crate) selected: Option<usize>,
+    pub(crate) x_offset: usize,
 }
 
 impl ViewState {
@@ -183,6 +193,101 @@ fn handle_help_key(key: KeyEvent, state: &mut ViewState) -> KeyAction {
     KeyAction::Continue
 }
 
+fn handle_values_key(
+    key: KeyEvent,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+) -> KeyAction {
+    const PANE_SCROLL_STEP: usize = 16;
+    sync_values_selection(entries, state);
+
+    match key.code {
+        KeyCode::Esc => {
+            close_values_pane(state);
+        }
+        KeyCode::Char('v') => {
+            cycle_values_pane(entries, state);
+        }
+        KeyCode::Char('/') => {
+            close_values_pane(state);
+            state.search_editing = true;
+            state.search_wrapped = false;
+        }
+        KeyCode::Up => move_values_selection(entries, state, -1),
+        KeyCode::Down => move_values_selection(entries, state, 1),
+        KeyCode::Left => {
+            state.values.x_offset = state.values.x_offset.saturating_sub(PANE_SCROLL_STEP);
+        }
+        KeyCode::Right => {
+            state.values.x_offset = state.values.x_offset.saturating_add(PANE_SCROLL_STEP);
+        }
+        KeyCode::Char('y') => return KeyAction::CopySelected,
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn open_values_pane(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    clear_search(state);
+    state.values.visible = true;
+    state.values.fullscreen = false;
+    sync_values_selection(entries, state);
+}
+
+fn cycle_values_pane(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    if !state.values.visible {
+        open_values_pane(entries, state);
+    } else if !state.values.fullscreen {
+        state.values.fullscreen = true;
+    } else {
+        close_values_pane(state);
+    }
+}
+
+fn close_values_pane(state: &mut ViewState) {
+    state.values.visible = false;
+    state.values.fullscreen = false;
+    state.values.selected = None;
+    state.values.x_offset = 0;
+}
+
+fn sync_values_selection(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
+    let value_count = selected_values_len(entries, state);
+    state.values.selected = match (state.values.selected, value_count) {
+        (_, 0) => None,
+        (Some(selected), count) => Some(cmp::min(selected, count - 1)),
+        (None, _) => Some(0),
+    };
+}
+
+fn move_values_selection(entries: &VecDeque<LogEntry>, state: &mut ViewState, delta: isize) {
+    let value_count = selected_values_len(entries, state);
+    if value_count == 0 {
+        state.values.selected = None;
+        return;
+    }
+
+    let selected = state.values.selected.unwrap_or(0);
+    state.values.selected = Some(if delta.is_negative() {
+        selected.saturating_sub(delta.unsigned_abs())
+    } else {
+        cmp::min(selected.saturating_add(delta as usize), value_count - 1)
+    });
+}
+
+fn selected_values_len(entries: &VecDeque<LogEntry>, state: &ViewState) -> usize {
+    selected_entry_for_values(entries, state)
+        .map(|entry| {
+            entry
+                .values
+                .iter()
+                .map(|section| section.fields.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn handle_normal_key(
     key: KeyEvent,
     entries: &VecDeque<LogEntry>,
@@ -194,12 +299,17 @@ fn handle_normal_key(
     let page_step = cmp::max(1, page_size.saturating_sub(1));
     const HORIZONTAL_SCROLL_STEP: usize = 16;
 
+    if state.values.visible {
+        return handle_values_key(key, entries, state);
+    }
+
     match key.code {
         KeyCode::Char('?') => {
             state.help_visible = !state.help_visible;
             return KeyAction::Continue;
         }
         KeyCode::Char('/') => {
+            close_values_pane(state);
             state.search_editing = true;
             state.search_wrapped = false;
             return KeyAction::Continue;
@@ -221,7 +331,7 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('v') => {
-            state.values_visible = !state.values_visible;
+            cycle_values_pane(entries, state);
             return KeyAction::Continue;
         }
         KeyCode::Char('f') => {
@@ -237,10 +347,6 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('y') => return KeyAction::CopySelected,
-        KeyCode::Esc if state.values_visible => {
-            state.values_visible = false;
-            return KeyAction::Continue;
-        }
         KeyCode::Esc if !state.search_query.is_empty() => {
             clear_search(state);
             return KeyAction::Continue;
@@ -302,12 +408,16 @@ pub(crate) fn draw(
 
     let top_bar_rows = usize::from(search_bar_visible(state));
     let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
-    let pane_width = values_pane_width(cols as usize, state.values_visible);
+    let pane_width = values_pane_width(cols as usize, &state.values);
     let pane_gap = usize::from(pane_width > 0);
-    let log_width = (cols as usize)
-        .saturating_sub(scrollbar_width)
-        .saturating_sub(pane_width)
-        .saturating_sub(pane_gap);
+    let log_width = if state.values.fullscreen {
+        0
+    } else {
+        (cols as usize)
+            .saturating_sub(scrollbar_width)
+            .saturating_sub(pane_width)
+            .saturating_sub(pane_gap)
+    };
     let visible = visible_indices(entries, state);
     let selected = state
         .selected
@@ -330,21 +440,23 @@ pub(crate) fn draw(
         draw_search_bar(stdout, entries, state, cols as usize)?;
     }
 
-    for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
-        let Some(entry) = entries.get(idx) else {
-            continue;
-        };
-        queue!(stdout, MoveTo(0, (screen_row + top_bar_rows) as u16))?;
-        EntryRenderer::from(state).draw(
-            stdout,
-            entry,
-            state.x_offset,
-            log_width,
-            Some(idx) == selected,
-        )?;
+    if !state.values.fullscreen {
+        for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
+            let Some(entry) = entries.get(idx) else {
+                continue;
+            };
+            queue!(stdout, MoveTo(0, (screen_row + top_bar_rows) as u16))?;
+            EntryRenderer::from(state).draw(
+                stdout,
+                entry,
+                state.x_offset,
+                log_width,
+                Some(idx) == selected,
+            )?;
+        }
     }
 
-    if scrollbar_width > 0 {
+    if scrollbar_width > 0 && !state.values.fullscreen {
         draw_scrollbar(
             stdout,
             entries,
@@ -363,11 +475,16 @@ pub(crate) fn draw(
     }
 
     if pane_width > 0 {
-        let pane_left = cols as usize - pane_width;
+        let pane_left = if state.values.fullscreen {
+            0
+        } else {
+            cols as usize - pane_width
+        };
         let selected_entry = selected.and_then(|idx| entries.get(idx));
         draw_values_pane(
             stdout,
             selected_entry,
+            &state.values,
             PaneViewport {
                 left: pane_left,
                 top: top_bar_rows,
@@ -519,11 +636,11 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  r               toggle raw log line display",
-        "  v               toggle tracing values pane",
+        "  v               open tracing values pane, or toggle pane fullscreen",
         "  /               search raw log lines",
         "  n / b           jump to next or previous search result",
         "  Esc             clear search, close help, or close values pane",
-        "  y               copy selected line to clipboard",
+        "  y               copy selected line or value to clipboard",
         "  ?               toggle this help page",
         "  q               exit after the process ends",
         "  Ctrl-C          kill process and exit",
@@ -533,7 +650,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  PgUp / PgDown   move cursor one page",
         "  Home / Pos1     move cursor to first retained line",
         "  End             move cursor to last retained line",
-        "  Left / Right    scroll horizontally",
+        "  Left / Right    scroll horizontally, or scroll values pane",
     ];
 
     for (row, line) in lines.iter().take(content_rows).enumerate() {
@@ -555,9 +672,20 @@ pub(crate) fn selected_line_text(
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
 ) -> Option<String> {
+    if state.values.visible {
+        return selected_value_text(entries, state);
+    }
+
     entries
         .get(state.selected?)
         .map(|entry| EntryRenderer::from(state).plain_text(entry))
+}
+
+fn selected_value_text(entries: &VecDeque<LogEntry>, state: &ViewState) -> Option<String> {
+    let entry = selected_entry_for_values(entries, state)?;
+    let selected = state.values.selected?;
+    let value = nth_value_field(entry, selected)?;
+    Some(format!("{} = {}", value.key, value.value.text()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -568,17 +696,24 @@ struct PaneViewport {
     height: usize,
 }
 
-fn values_pane_width(cols: usize, visible: bool) -> usize {
-    if !visible || cols < 60 {
+fn values_pane_width(cols: usize, state: &ValuesPaneState) -> usize {
+    if !state.visible {
         return 0;
     }
 
-    (cols / 3).clamp(24, 42)
+    if state.fullscreen {
+        cols
+    } else if cols < 60 {
+        0
+    } else {
+        (cols / 3).clamp(24, 42)
+    }
 }
 
 fn draw_values_pane(
     stdout: &mut impl Write,
     entry: Option<&LogEntry>,
+    state: &ValuesPaneState,
     viewport: PaneViewport,
 ) -> Result<()> {
     if viewport.width == 0 || viewport.height == 0 {
@@ -594,34 +729,163 @@ fn draw_values_pane(
         )?;
 
         match row {
-            0 => print_padded_segment(stdout, "Tracing values", text_width, Color::Cyan, true)?,
-            1 => print_padded_segment(stdout, "", text_width, Color::White, false)?,
-            row => {
-                let value = entry.and_then(|entry| entry.values.get(row - 2));
-                if let Some(value) = value {
-                    let prefix = visible_slice(&format!("{} = ", value.key), 0, text_width);
-                    queue!(
+            0 => print_padded_segment(
+                stdout,
+                "Tracing values",
+                0,
+                text_width,
+                Color::Cyan,
+                false,
+                true,
+            )?,
+            row => match entry.and_then(|entry| values_pane_row(entry, row - 1)) {
+                Some(ValuesPaneRow::Section(title)) => {
+                    print_padded_segment(stdout, title, 0, text_width, Color::Cyan, false, true)?;
+                }
+                Some(ValuesPaneRow::Field { index, field }) => {
+                    let selected = state.selected == Some(index);
+                    print_value_row(
                         stdout,
-                        PrintStyledContent(prefix.clone().with(Color::White))
+                        &field.key,
+                        field.value.text(),
+                        trace_value_color(&field.value),
+                        state.x_offset,
+                        text_width,
+                        selected,
                     )?;
-                    print_padded_segment(
-                        stdout,
-                        value.value.text(),
-                        text_width.saturating_sub(prefix.chars().count()),
-                        trace_value_color(&value.value),
-                        false,
-                    )?;
-                } else {
+                }
+                Some(ValuesPaneRow::Spacer) => {
+                    print_padded_segment(stdout, "", 0, text_width, Color::White, false, false)?;
+                }
+                None => {
                     let empty_label =
-                        if row == 2 && entry.is_none_or(|entry| entry.values.is_empty()) {
+                        if row == 1 && entry.is_none_or(|entry| value_field_count(entry) == 0) {
                             "No values"
                         } else {
                             ""
                         };
-                    print_padded_segment(stdout, empty_label, text_width, Color::White, false)?;
+                    print_padded_segment(
+                        stdout,
+                        empty_label,
+                        0,
+                        text_width,
+                        Color::White,
+                        false,
+                        false,
+                    )?;
                 }
-            }
+            },
         }
+        queue!(stdout, ResetColor)?;
+    }
+
+    Ok(())
+}
+
+enum ValuesPaneRow<'a> {
+    Section(&'a str),
+    Field {
+        index: usize,
+        field: &'a TraceValueField,
+    },
+    Spacer,
+}
+
+fn values_pane_row(entry: &LogEntry, row: usize) -> Option<ValuesPaneRow<'_>> {
+    let mut row = row;
+    let mut field_index = 0usize;
+    let mut needs_spacer = false;
+
+    for section in &entry.values {
+        if section.fields.is_empty() {
+            continue;
+        }
+        if needs_spacer {
+            if row == 0 {
+                return Some(ValuesPaneRow::Spacer);
+            }
+            row -= 1;
+        }
+        if row == 0 {
+            return Some(ValuesPaneRow::Section(&section.title));
+        }
+        row -= 1;
+
+        if row < section.fields.len() {
+            return Some(ValuesPaneRow::Field {
+                index: field_index + row,
+                field: &section.fields[row],
+            });
+        }
+        row -= section.fields.len();
+        field_index += section.fields.len();
+        needs_spacer = true;
+    }
+
+    None
+}
+
+fn nth_value_field(entry: &LogEntry, selected: usize) -> Option<&TraceValueField> {
+    let mut selected = selected;
+    for section in &entry.values {
+        if selected < section.fields.len() {
+            return section.fields.get(selected);
+        }
+        selected -= section.fields.len();
+    }
+    None
+}
+
+fn value_field_count(entry: &LogEntry) -> usize {
+    entry
+        .values
+        .iter()
+        .map(|section| section.fields.len())
+        .sum()
+}
+
+fn print_value_row(
+    stdout: &mut impl Write,
+    key: &str,
+    value: &str,
+    value_color: Color,
+    x_offset: usize,
+    width: usize,
+    selected: bool,
+) -> Result<()> {
+    let prefix = format!("{key} = ");
+    let prefix_width = prefix.chars().count();
+
+    if x_offset < prefix_width {
+        let prefix_width = cmp::min(prefix_width - x_offset, width);
+        print_padded_segment(
+            stdout,
+            &prefix,
+            x_offset,
+            prefix_width,
+            Color::White,
+            selected,
+            false,
+        )?;
+        print_padded_segment(
+            stdout,
+            value,
+            0,
+            width.saturating_sub(prefix_width),
+            value_color,
+            selected,
+            false,
+        )?;
+    } else {
+        print_padded_segment(
+            stdout,
+            value,
+            x_offset - prefix_width,
+            width,
+            value_color,
+            selected,
+            false,
+        )?;
     }
 
     Ok(())
@@ -630,13 +894,21 @@ fn draw_values_pane(
 fn print_padded_segment(
     stdout: &mut impl Write,
     text: &str,
+    x_offset: usize,
     width: usize,
     color: Color,
+    selected: bool,
     bold: bool,
 ) -> Result<()> {
-    let text = visible_slice(text, 0, width);
+    let text = visible_slice(text, x_offset, width);
+    let background = if selected {
+        selected_background()
+    } else {
+        Color::Reset
+    };
     queue!(
         stdout,
+        SetBackgroundColor(background),
         PrintStyledContent(apply_style(format!("{text:<width$}"), color, bold))
     )?;
     Ok(())
@@ -658,6 +930,18 @@ fn visible_indices(entries: &VecDeque<LogEntry>, state: &ViewState) -> Vec<usize
         .enumerate()
         .filter_map(|(idx, entry)| entry_visible(entry, state).then_some(idx))
         .collect()
+}
+
+fn selected_entry_for_values<'a>(
+    entries: &'a VecDeque<LogEntry>,
+    state: &ViewState,
+) -> Option<&'a LogEntry> {
+    let visible = visible_indices(entries, state);
+    let selected = state
+        .selected
+        .filter(|selected| visible.contains(selected))
+        .or_else(|| visible.last().copied())?;
+    entries.get(selected)
 }
 
 fn entry_visible(entry: &LogEntry, state: &ViewState) -> bool {
@@ -1327,7 +1611,7 @@ fn status_line(
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
-        if state.values_visible { "on" } else { "off" },
+        if state.values.visible { "on" } else { "off" },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
@@ -1535,7 +1819,7 @@ fn visible_slice(input: &str, offset: usize, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TraceValueField;
+    use crate::model::TraceValueSection;
 
     fn entries(count: usize) -> VecDeque<LogEntry> {
         (0..count)
@@ -1585,6 +1869,10 @@ mod tests {
     }
 
     fn entry_with_values(values: Vec<TraceValueField>) -> LogEntry {
+        entry_with_value_sections(vec![TraceValueSection::new("event", values)])
+    }
+
+    fn entry_with_value_sections(values: Vec<TraceValueSection>) -> LogEntry {
         LogEntry {
             raw: "raw line".to_string(),
             timestamp: None,
@@ -1712,26 +2000,42 @@ mod tests {
     }
 
     #[test]
-    fn v_toggles_tracing_values_pane() {
-        let entries = entries(1);
+    fn v_cycles_tracing_values_pane_side_fullscreen_closed() {
+        let entries = VecDeque::from([entry_with_values(vec![TraceValueField::new(
+            "id",
+            TraceValue::Number("7".to_string()),
+        )])]);
         let mut state = ViewState::new();
 
-        assert!(!state.values_visible);
+        assert!(!state.values.visible);
         assert_eq!(
             handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5),
             KeyAction::Continue
         );
-        assert!(state.values_visible);
+        assert!(state.values.visible);
+        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.selected, Some(0));
 
         handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
-        assert!(!state.values_visible);
+        assert!(state.values.visible);
+        assert!(state.values.fullscreen);
+
+        handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
+        assert!(!state.values.visible);
+        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.selected, None);
     }
 
     #[test]
     fn escape_closes_tracing_values_pane() {
         let entries = entries(1);
         let mut state = ViewState {
-            values_visible: true,
+            values: ValuesPaneState {
+                visible: true,
+                fullscreen: true,
+                selected: Some(0),
+                x_offset: 16,
+            },
             search_query: "line".to_string(),
             ..ViewState::new()
         };
@@ -1740,36 +2044,135 @@ mod tests {
             handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5),
             KeyAction::Continue
         );
-        assert!(!state.values_visible);
+        assert!(!state.values.visible);
+        assert!(!state.values.fullscreen);
+        assert_eq!(state.values.selected, None);
+        assert_eq!(state.values.x_offset, 0);
         assert_eq!(state.search_query, "line");
     }
 
     #[test]
-    fn values_pane_draws_stored_tracing_values() {
-        let entry = entry_with_values(vec![
+    fn arrow_keys_select_and_scroll_values_when_pane_is_open() {
+        let entries = VecDeque::from([entry_with_values(vec![
             TraceValueField::new("id", TraceValue::Number("7".to_string())),
             TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+        ])]);
+        let mut state = ViewState {
+            selected: Some(0),
+            values: ValuesPaneState {
+                visible: true,
+                ..ValuesPaneState::default()
+            },
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.values.selected, Some(1));
+
+        handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
+        assert_eq!(state.values.selected, Some(0));
+
+        handle_key(key(KeyCode::Right), &entries, &mut state, false, 5);
+        assert_eq!(state.x_offset, 0);
+        assert_eq!(state.values.x_offset, 16);
+
+        handle_key(key(KeyCode::Left), &entries, &mut state, false, 5);
+        assert_eq!(state.values.x_offset, 0);
+    }
+
+    #[test]
+    fn y_copies_selected_value_when_values_pane_is_open() {
+        let entries = VecDeque::from([entry_with_values(vec![
+            TraceValueField::new("id", TraceValue::Number("7".to_string())),
+            TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+        ])]);
+        let mut state = ViewState {
+            selected: Some(0),
+            values: ValuesPaneState {
+                visible: true,
+                selected: Some(1),
+                ..ValuesPaneState::default()
+            },
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('y')), &entries, &mut state, false, 5),
+            KeyAction::CopySelected
+        );
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some(r#"tag = "admin""#)
+        );
+    }
+
+    #[test]
+    fn slash_closes_values_pane_and_starts_search() {
+        let entries = entries(1);
+        let mut state = ViewState {
+            values: ValuesPaneState {
+                visible: true,
+                fullscreen: true,
+                selected: Some(0),
+                x_offset: 16,
+            },
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('/')), &entries, &mut state, false, 5);
+
+        assert!(!state.values.visible);
+        assert!(!state.values.fullscreen);
+        assert!(state.search_editing);
+    }
+
+    #[test]
+    fn values_pane_draws_stored_tracing_values() {
+        let entry = entry_with_value_sections(vec![
+            TraceValueSection::new(
+                "scope: request",
+                vec![TraceValueField::new(
+                    "id",
+                    TraceValue::Number("7".to_string()),
+                )],
+            ),
+            TraceValueSection::new(
+                "event",
+                vec![TraceValueField::new(
+                    "tag",
+                    TraceValue::String("\"admin\"".to_string()),
+                )],
+            ),
         ]);
         let mut output = Vec::new();
 
         draw_values_pane(
             &mut output,
             Some(&entry),
+            &ValuesPaneState::default(),
             PaneViewport {
                 left: 0,
                 top: 0,
                 width: 40,
-                height: 5,
+                height: 6,
             },
         )
         .expect("draw pane");
         let text = String::from_utf8(output).expect("utf8");
 
         assert!(text.contains("Tracing values"));
+        assert!(text.contains("scope: request"));
+        assert!(text.contains("event"));
         assert!(text.contains("id = "));
         assert!(text.contains("7"));
         assert!(text.contains("tag = "));
         assert!(text.contains("\"admin\""));
+        assert!(text.find("scope: request").unwrap() < text.find("event").unwrap());
+        assert!(matches!(
+            values_pane_row(&entry, 2),
+            Some(ValuesPaneRow::Spacer)
+        ));
     }
 
     #[test]
