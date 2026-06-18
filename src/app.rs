@@ -78,6 +78,7 @@ fn event_loop(
                         parsed: false,
                         target: Some("traceviewer".to_string()),
                         spans: Vec::new(),
+                        values: Vec::new(),
                         message,
                         message_parts: Vec::new(),
                         stream,

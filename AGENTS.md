@@ -5,12 +5,12 @@
 When adding, removing, or changing a keyboard shortcut:
 
 - Update the in-app help text in `src/ui.rs`.
-- Update the `Controls` section in `README.md`.
+- There should be no controls in `README.md`; do not add a Controls section or
+  document shortcuts there.
 - Add or update tests for the key handling behavior.
 
-Keep the README and in-app help in sync. If a shortcut affects copied output,
-filtering, selection, scrolling, or display state, include that behavior in the
-tests.
+If a shortcut affects copied output, filtering, selection, scrolling, or display
+state, include that behavior in the tests.
 
 ## Rust Checks
 

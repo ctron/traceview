@@ -1,6 +1,6 @@
 use crate::{
     cli::LogFormat,
-    model::{Level, LogEntry, MessagePart, MessageStyle, Stream},
+    model::{Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue, TraceValueField},
 };
 use serde_json::{Map, Value};
 
@@ -28,6 +28,7 @@ pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> 
         timestamp: None,
         target: None,
         spans: Vec::new(),
+        values: Vec::new(),
         message: raw.clone(),
         message_parts: Vec::new(),
         parsed: false,
@@ -104,6 +105,7 @@ fn parse_env_logger(raw: &str) -> Option<LogEntry> {
         parsed: true,
         target,
         spans: Vec::new(),
+        values: Vec::new(),
         message: message.to_string(),
         message_parts: Vec::new(),
         stream: Stream::Stdout,
@@ -122,7 +124,9 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
     };
 
     let (target, spans, message) = split_tracing_target_message(rest);
-    let message_parts = tracing_message_parts(&message);
+    let mut values = span_value_fields(&spans);
+    let (message_parts, message_values) = tracing_message_parts(&message);
+    values.extend(message_values);
     let message = MessagePart::plain_text(&message_parts);
 
     Some(LogEntry {
@@ -132,6 +136,7 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
         parsed: true,
         target,
         spans,
+        values,
         message,
         message_parts,
         stream: Stream::Stdout,
@@ -165,6 +170,7 @@ fn parse_bunyan(raw: &str, stream: Stream) -> Option<LogEntry> {
         parsed: true,
         target,
         spans: Vec::new(),
+        values: Vec::new(),
         message,
         message_parts,
         stream,
@@ -213,12 +219,15 @@ fn bunyan_message_parts(message: &str, fields: &Map<String, Value>) -> Vec<Messa
 #[derive(Debug, Eq, PartialEq)]
 struct TracingField {
     key: String,
-    value: String,
+    value: TraceValue,
 }
 
-fn tracing_message_parts(message: &str) -> Vec<MessagePart> {
+fn tracing_message_parts(message: &str) -> (Vec<MessagePart>, Vec<TraceValueField>) {
     let Some((message, fields)) = split_tracing_message_fields(message) else {
-        return vec![MessagePart::new(message, MessageStyle::Default)];
+        return (
+            vec![MessagePart::new(message, MessageStyle::Default)],
+            Vec::new(),
+        );
     };
 
     let mut parts = Vec::new();
@@ -238,7 +247,81 @@ fn tracing_message_parts(message: &str) -> Vec<MessagePart> {
         push_tracing_value_part(&mut parts, &field.value);
     }
     parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
-    parts
+    let values = fields
+        .into_iter()
+        .map(|field| TraceValueField::new(field.key, field.value))
+        .collect();
+    (parts, values)
+}
+
+fn span_value_fields(spans: &[String]) -> Vec<TraceValueField> {
+    spans
+        .iter()
+        .flat_map(|span| {
+            let Some(open) = span.find('{') else {
+                return Vec::new();
+            };
+            if !span.ends_with('}') {
+                return Vec::new();
+            }
+
+            split_top_level(&span[open + 1..span.len() - 1], ',')
+                .into_iter()
+                .filter_map(parse_span_value_field)
+                .collect()
+        })
+        .collect()
+}
+
+fn parse_span_value_field(field: &str) -> Option<TraceValueField> {
+    let (separator, _) = field
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '=' | ':'))?;
+    let key = field[..separator].trim();
+    let value = field[separator + 1..].trim();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+
+    Some(TraceValueField::new(
+        key,
+        TraceValue::from_tracing_text(value),
+    ))
+}
+
+fn split_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quote = true,
+            '{' | '[' | '(' => depth = depth.saturating_add(1),
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            ch if ch == separator && depth == 0 => {
+                fields.push(value[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fields.push(value[start..].trim());
+    fields
 }
 
 fn split_tracing_message_fields(message: &str) -> Option<(String, Vec<TracingField>)> {
@@ -269,7 +352,7 @@ fn parse_tracing_field_sequence(value: &str) -> Option<Vec<TracingField>> {
         let tail = rest[end..].trim_start();
         let field = TracingField {
             key: key.to_string(),
-            value: field_value.to_string(),
+            value: TraceValue::from_tracing_text(field_value),
         };
         if tail.is_empty() {
             if unquoted_value_has_top_level_whitespace(field_value) {
@@ -392,20 +475,18 @@ fn quoted_value_end(value: &str) -> Option<usize> {
     None
 }
 
-fn push_tracing_value_part(parts: &mut Vec<MessagePart>, value: &str) {
-    let style = if matches!(value, "true" | "false") {
-        MessageStyle::JsonBool
-    } else if value == "null" {
-        MessageStyle::JsonNull
-    } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        MessageStyle::JsonNumber
-    } else if value.starts_with('"') && value.ends_with('"') {
-        MessageStyle::JsonString
-    } else {
-        MessageStyle::Default
+fn push_tracing_value_part(parts: &mut Vec<MessagePart>, value: &TraceValue) {
+    let style = match value {
+        TraceValue::Bool(_) => MessageStyle::JsonBool,
+        TraceValue::Null(_) => MessageStyle::JsonNull,
+        TraceValue::Number(_) => MessageStyle::JsonNumber,
+        TraceValue::String(_) => MessageStyle::JsonString,
+        TraceValue::Object(_) => MessageStyle::JsonObject,
+        TraceValue::Array(_) => MessageStyle::JsonArray,
+        TraceValue::Other(_) => MessageStyle::Default,
     };
 
-    parts.push(MessagePart::new(value, style));
+    parts.push(MessagePart::new(value.text(), style));
 }
 
 fn push_json_value_parts(parts: &mut Vec<MessagePart>, value: &Value) {
@@ -789,8 +870,35 @@ mod tests {
                 MessagePart::new(" ", MessageStyle::JsonPunctuation),
                 MessagePart::new("error.sources", MessageStyle::JsonKey),
                 MessagePart::new("=", MessageStyle::JsonPunctuation),
-                MessagePart::new("[out of space, out of cash]", MessageStyle::Default),
+                MessagePart::new("[out of space, out of cash]", MessageStyle::JsonArray),
                 MessagePart::new(")", MessageStyle::JsonPunctuation),
+            ]
+        );
+        assert_eq!(
+            entry.values,
+            vec![
+                TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
+                TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+                TraceValueField::new(
+                    "error.sources",
+                    TraceValue::Array("[out of space, out of cash]".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tracing_span_fields_as_values() {
+        let entry =
+            parse_tracing("2026-06-15T12:01:02Z INFO request{id=7, ok=true}: svc: loaded user")
+                .expect("entry");
+
+        assert_eq!(
+            entry.values,
+            vec![
+                TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                TraceValueField::new("ok", TraceValue::Bool("true".to_string())),
             ]
         );
     }

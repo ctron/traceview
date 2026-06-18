@@ -57,9 +57,69 @@ pub(crate) struct LogEntry {
     pub(crate) parsed: bool,
     pub(crate) target: Option<String>,
     pub(crate) spans: Vec<String>,
+    pub(crate) values: Vec<TraceValueField>,
     pub(crate) message: String,
     pub(crate) message_parts: Vec<MessagePart>,
     pub(crate) stream: Stream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TraceValueField {
+    pub(crate) key: String,
+    pub(crate) value: TraceValue,
+}
+
+impl TraceValueField {
+    pub(crate) fn new(key: impl Into<String>, value: TraceValue) -> Self {
+        Self {
+            key: key.into(),
+            value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TraceValue {
+    Bool(String),
+    Null(String),
+    Number(String),
+    String(String),
+    Object(String),
+    Array(String),
+    Other(String),
+}
+
+impl TraceValue {
+    pub(crate) fn from_tracing_text(value: &str) -> Self {
+        let value = value.to_string();
+        if matches!(value.as_str(), "true" | "false") {
+            Self::Bool(value)
+        } else if value == "null" {
+            Self::Null(value)
+        } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+            Self::Number(value)
+        } else if value.starts_with('"') && value.ends_with('"') {
+            Self::String(value)
+        } else if value.starts_with('{') && value.ends_with('}') {
+            Self::Object(value)
+        } else if value.starts_with('[') && value.ends_with(']') {
+            Self::Array(value)
+        } else {
+            Self::Other(value)
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Bool(value)
+            | Self::Null(value)
+            | Self::Number(value)
+            | Self::String(value)
+            | Self::Object(value)
+            | Self::Array(value)
+            | Self::Other(value) => value,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

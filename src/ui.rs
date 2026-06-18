@@ -12,7 +12,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 
-use crate::model::{Level, LogEntry, MessagePart, MessageStyle, Stream};
+use crate::model::{Level, LogEntry, MessagePart, MessageStyle, Stream, TraceValue};
 
 #[derive(Debug, Default)]
 pub(crate) struct ViewState {
@@ -20,6 +20,7 @@ pub(crate) struct ViewState {
     pub(crate) first_visible: usize,
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
+    pub(crate) values_visible: bool,
     pub(crate) show_spans: bool,
     pub(crate) show_raw: bool,
     pub(crate) search_query: String,
@@ -219,6 +220,10 @@ fn handle_normal_key(
             state.show_raw = !state.show_raw;
             return KeyAction::Continue;
         }
+        KeyCode::Char('v') => {
+            state.values_visible = !state.values_visible;
+            return KeyAction::Continue;
+        }
         KeyCode::Char('f') => {
             state.focus_target = if state.focus_target.is_some() {
                 None
@@ -232,6 +237,10 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('y') => return KeyAction::CopySelected,
+        KeyCode::Esc if state.values_visible => {
+            state.values_visible = false;
+            return KeyAction::Continue;
+        }
         KeyCode::Esc if !state.search_query.is_empty() => {
             clear_search(state);
             return KeyAction::Continue;
@@ -293,7 +302,12 @@ pub(crate) fn draw(
 
     let top_bar_rows = usize::from(search_bar_visible(state));
     let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
-    let log_width = (cols as usize).saturating_sub(scrollbar_width);
+    let pane_width = values_pane_width(cols as usize, state.values_visible);
+    let pane_gap = usize::from(pane_width > 0);
+    let log_width = (cols as usize)
+        .saturating_sub(scrollbar_width)
+        .saturating_sub(pane_width)
+        .saturating_sub(pane_gap);
     let visible = visible_indices(entries, state);
     let selected = state
         .selected
@@ -340,7 +354,25 @@ pub(crate) fn draw(
                 visible_end: end_pos,
                 height: content_rows,
                 top_row: top_bar_rows,
-                column: cols.saturating_sub(1),
+                column: cols
+                    .saturating_sub(1)
+                    .saturating_sub(pane_width as u16)
+                    .saturating_sub(pane_gap as u16),
+            },
+        )?;
+    }
+
+    if pane_width > 0 {
+        let pane_left = cols as usize - pane_width;
+        let selected_entry = selected.and_then(|idx| entries.get(idx));
+        draw_values_pane(
+            stdout,
+            selected_entry,
+            PaneViewport {
+                left: pane_left,
+                top: top_bar_rows,
+                width: pane_width,
+                height: content_rows,
             },
         )?;
     }
@@ -487,9 +519,10 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  r               toggle raw log line display",
+        "  v               toggle tracing values pane",
         "  /               search raw log lines",
         "  n / b           jump to next or previous search result",
-        "  Esc             clear search, or close help",
+        "  Esc             clear search, close help, or close values pane",
         "  y               copy selected line to clipboard",
         "  ?               toggle this help page",
         "  q               exit after the process ends",
@@ -525,6 +558,98 @@ pub(crate) fn selected_line_text(
     entries
         .get(state.selected?)
         .map(|entry| EntryRenderer::from(state).plain_text(entry))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaneViewport {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+}
+
+fn values_pane_width(cols: usize, visible: bool) -> usize {
+    if !visible || cols < 60 {
+        return 0;
+    }
+
+    (cols / 3).clamp(24, 42)
+}
+
+fn draw_values_pane(
+    stdout: &mut impl Write,
+    entry: Option<&LogEntry>,
+    viewport: PaneViewport,
+) -> Result<()> {
+    if viewport.width == 0 || viewport.height == 0 {
+        return Ok(());
+    }
+
+    for row in 0..viewport.height {
+        let text_width = viewport.width.saturating_sub(1);
+        queue!(
+            stdout,
+            MoveTo(viewport.left as u16, (viewport.top + row) as u16),
+            PrintStyledContent("|".with(Color::DarkGrey))
+        )?;
+
+        match row {
+            0 => print_padded_segment(stdout, "Tracing values", text_width, Color::Cyan, true)?,
+            1 => print_padded_segment(stdout, "", text_width, Color::White, false)?,
+            row => {
+                let value = entry.and_then(|entry| entry.values.get(row - 2));
+                if let Some(value) = value {
+                    let prefix = visible_slice(&format!("{} = ", value.key), 0, text_width);
+                    queue!(
+                        stdout,
+                        PrintStyledContent(prefix.clone().with(Color::White))
+                    )?;
+                    print_padded_segment(
+                        stdout,
+                        value.value.text(),
+                        text_width.saturating_sub(prefix.chars().count()),
+                        trace_value_color(&value.value),
+                        false,
+                    )?;
+                } else {
+                    let empty_label =
+                        if row == 2 && entry.is_none_or(|entry| entry.values.is_empty()) {
+                            "No values"
+                        } else {
+                            ""
+                        };
+                    print_padded_segment(stdout, empty_label, text_width, Color::White, false)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_padded_segment(
+    stdout: &mut impl Write,
+    text: &str,
+    width: usize,
+    color: Color,
+    bold: bool,
+) -> Result<()> {
+    let text = visible_slice(text, 0, width);
+    queue!(
+        stdout,
+        PrintStyledContent(apply_style(format!("{text:<width$}"), color, bold))
+    )?;
+    Ok(())
+}
+
+fn trace_value_color(value: &TraceValue) -> Color {
+    match value {
+        TraceValue::Bool(_) | TraceValue::Number(_) => Color::Reset,
+        TraceValue::String(_) => Color::Green,
+        TraceValue::Null(_) => Color::DarkGrey,
+        TraceValue::Object(_) | TraceValue::Array(_) => Color::Reset,
+        TraceValue::Other(_) => Color::White,
+    }
 }
 
 fn visible_indices(entries: &VecDeque<LogEntry>, state: &ViewState) -> Vec<usize> {
@@ -1198,10 +1323,11 @@ fn status_line(
     let search = search_status(entries, state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {}{focus}{search} | ? help ",
+        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {} | values {}{focus}{search} | ? help ",
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
+        if state.values_visible { "on" } else { "off" },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
@@ -1409,6 +1535,7 @@ fn visible_slice(input: &str, offset: usize, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TraceValueField;
 
     fn entries(count: usize) -> VecDeque<LogEntry> {
         (0..count)
@@ -1419,6 +1546,7 @@ mod tests {
                 parsed: true,
                 target: None,
                 spans: Vec::new(),
+                values: Vec::new(),
                 message: format!("line {idx}"),
                 message_parts: Vec::new(),
                 stream: Stream::Stdout,
@@ -1434,6 +1562,7 @@ mod tests {
             parsed: true,
             target: None,
             spans: Vec::new(),
+            values: Vec::new(),
             message: "line".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
@@ -1448,7 +1577,23 @@ mod tests {
             parsed: true,
             target: target.map(str::to_string),
             spans: Vec::new(),
+            values: Vec::new(),
             message: message.to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        }
+    }
+
+    fn entry_with_values(values: Vec<TraceValueField>) -> LogEntry {
+        LogEntry {
+            raw: "raw line".to_string(),
+            timestamp: None,
+            level: Level::Info,
+            parsed: true,
+            target: None,
+            spans: Vec::new(),
+            values,
+            message: "line".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
         }
@@ -1564,6 +1709,67 @@ mod tests {
 
         handle_key(key(KeyCode::Char('r')), &entries, &mut state, false, 5);
         assert!(!state.show_raw);
+    }
+
+    #[test]
+    fn v_toggles_tracing_values_pane() {
+        let entries = entries(1);
+        let mut state = ViewState::new();
+
+        assert!(!state.values_visible);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(state.values_visible);
+
+        handle_key(key(KeyCode::Char('v')), &entries, &mut state, false, 5);
+        assert!(!state.values_visible);
+    }
+
+    #[test]
+    fn escape_closes_tracing_values_pane() {
+        let entries = entries(1);
+        let mut state = ViewState {
+            values_visible: true,
+            search_query: "line".to_string(),
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(!state.values_visible);
+        assert_eq!(state.search_query, "line");
+    }
+
+    #[test]
+    fn values_pane_draws_stored_tracing_values() {
+        let entry = entry_with_values(vec![
+            TraceValueField::new("id", TraceValue::Number("7".to_string())),
+            TraceValueField::new("tag", TraceValue::String("\"admin\"".to_string())),
+        ]);
+        let mut output = Vec::new();
+
+        draw_values_pane(
+            &mut output,
+            Some(&entry),
+            PaneViewport {
+                left: 0,
+                top: 0,
+                width: 40,
+                height: 5,
+            },
+        )
+        .expect("draw pane");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("Tracing values"));
+        assert!(text.contains("id = "));
+        assert!(text.contains("7"));
+        assert!(text.contains("tag = "));
+        assert!(text.contains("\"admin\""));
     }
 
     #[test]
@@ -1857,6 +2063,7 @@ mod tests {
             parsed: true,
             target: Some("svc".to_string()),
             spans: Vec::new(),
+            values: Vec::new(),
             message: "parsed message".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
@@ -1878,6 +2085,7 @@ mod tests {
             parsed: true,
             target: Some("svc".to_string()),
             spans: Vec::new(),
+            values: Vec::new(),
             message: "parsed message".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
@@ -2041,6 +2249,7 @@ mod tests {
             parsed: true,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
+            values: Vec::new(),
             message: "loaded \"user\"".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
@@ -2066,6 +2275,7 @@ mod tests {
             parsed: true,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
+            values: Vec::new(),
             message: "loaded \"user\"".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
@@ -2092,6 +2302,7 @@ mod tests {
             parsed: true,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
+            values: Vec::new(),
             message: "loaded \"user\"".to_string(),
             message_parts: Vec::new(),
             stream: Stream::Stdout,
