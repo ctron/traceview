@@ -60,15 +60,22 @@ impl LevelFilter {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn status_label(self) -> &'static str {
         match self {
-            Self::All => "all",
-            Self::AtLeast(Level::Debug) => "debug+",
-            Self::AtLeast(Level::Info) => "info+",
-            Self::AtLeast(Level::Warn) => "warn+",
-            Self::AtLeast(Level::Error) => "error",
-            Self::AtLeast(Level::Trace) => "trace+",
-            Self::AtLeast(Level::Unknown) => "unknown+",
+            Self::All => "ALL",
+            Self::AtLeast(Level::Debug) => "DEBUG+",
+            Self::AtLeast(Level::Info) => "INFO+",
+            Self::AtLeast(Level::Warn) => "WARN+",
+            Self::AtLeast(Level::Error) => "ERROR",
+            Self::AtLeast(Level::Trace) => "TRACE+",
+            Self::AtLeast(Level::Unknown) => "UNKNOWN+",
+        }
+    }
+
+    fn status_color(self) -> Color {
+        match self {
+            Self::All => status_bar_foreground(),
+            Self::AtLeast(level) => level_color(level),
         }
     }
 }
@@ -481,14 +488,14 @@ pub(crate) fn draw(
     if state.help_visible {
         queue!(stdout, Hide, Clear(ClearType::All))?;
         draw_help_page(stdout, cols, content_rows)?;
-        let status = status_line(entries, state, exit_status, input_finished, cols as usize);
-        queue!(
+        draw_status_line(
             stdout,
-            MoveTo(0, rows.saturating_sub(1)),
-            SetForegroundColor(status_bar_foreground()),
-            SetBackgroundColor(status_bar_background()),
-            Print(status),
-            ResetColor
+            entries,
+            state,
+            exit_status,
+            input_finished,
+            cols as usize,
+            rows.saturating_sub(1),
         )?;
         stdout.flush()?;
         return Ok(());
@@ -582,14 +589,14 @@ pub(crate) fn draw(
         )?;
     }
 
-    let status = status_line(entries, state, exit_status, input_finished, cols as usize);
-    queue!(
+    draw_status_line(
         stdout,
-        MoveTo(0, rows.saturating_sub(1)),
-        SetForegroundColor(status_bar_foreground()),
-        SetBackgroundColor(status_bar_background()),
-        Print(status),
-        ResetColor
+        entries,
+        state,
+        exit_status,
+        input_finished,
+        cols as usize,
+        rows.saturating_sub(1),
     )?;
     stdout.flush()?;
     Ok(())
@@ -1793,6 +1800,43 @@ fn selected_foreground(color: Color) -> Color {
     }
 }
 
+fn draw_status_line(
+    stdout: &mut impl Write,
+    entries: &VecDeque<LogEntry>,
+    state: &ViewState,
+    exit_status: Option<ExitStatus>,
+    input_finished: bool,
+    width: usize,
+    row: u16,
+) -> Result<()> {
+    let status = status_line(entries, state, exit_status, input_finished, width);
+    let filter = state.level_filter.status_label();
+
+    queue!(
+        stdout,
+        MoveTo(0, row),
+        SetForegroundColor(status_bar_foreground()),
+        SetBackgroundColor(status_bar_background()),
+    )?;
+
+    if let Some(start) = status.find(filter) {
+        let end = start + filter.len();
+        queue!(
+            stdout,
+            Print(&status[..start]),
+            SetForegroundColor(state.level_filter.status_color()),
+            Print(&status[start..end]),
+            SetForegroundColor(status_bar_foreground()),
+            Print(&status[end..]),
+            ResetColor
+        )?;
+    } else {
+        queue!(stdout, Print(status), ResetColor)?;
+    }
+
+    Ok(())
+}
+
 fn status_line(
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
@@ -1821,16 +1865,11 @@ fn status_line(
     let search = search_status(entries, state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | min {} | x={} | spans {} | raw {} | values {} | ? help ",
-        state.level_filter.label(),
+        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={} | spans {} | raw {} | ? help ",
+        state.level_filter.status_label(),
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
-        if state.values.mode != ValuesPaneMode::Closed {
-            "on"
-        } else {
-            "off"
-        },
         entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
@@ -2928,7 +2967,7 @@ mod tests {
         let status = status_line(&entries, &state, None, false, 160);
 
         assert!(status.contains("lvl E1 W1 I1 D1 T1 U1"));
-        assert!(status.contains("min warn+"));
+        assert!(status.contains("| WARN+ |"));
     }
 
     #[test]
