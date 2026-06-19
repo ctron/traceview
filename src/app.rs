@@ -53,6 +53,23 @@ fn event_loop(
     loop {
         let page_size = content_rows(terminal::size()?.1, &state);
 
+        if event::poll(Duration::ZERO)?
+            && let Event::Key(key) = event::read()?
+        {
+            if handle_terminal_key(
+                key,
+                terminal,
+                input,
+                &entries,
+                &mut state,
+                exit_status.is_some() || input_finished,
+                page_size,
+            )? {
+                return Ok(());
+            }
+            dirty = true;
+        }
+
         for _ in 0..MAX_EVENTS_PER_TICK {
             let Ok(app_event) = input.events.try_recv() else {
                 break;
@@ -110,29 +127,47 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
-            match handle_key(
+            if handle_terminal_key(
                 key,
+                terminal,
+                input,
                 &entries,
                 &mut state,
                 exit_status.is_some() || input_finished,
                 page_size,
-            ) {
-                KeyAction::Continue => {}
-                KeyAction::CopySelected => {
-                    if let Some(line) = selected_line_text(&entries, &state) {
-                        copy_to_clipboard(&line)?;
-                    }
-                }
-                KeyAction::Quit => {
-                    if exit_status.is_none() && !input_finished {
-                        input.terminate();
-                    }
-                    break;
-                }
+            )? {
+                return Ok(());
             }
             dirty = true;
         }
     }
+}
 
-    Ok(())
+fn handle_terminal_key(
+    key: crossterm::event::KeyEvent,
+    terminal: &TerminalGuard,
+    input: &RunningInput,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    input_finished: bool,
+    page_size: usize,
+) -> Result<bool> {
+    match handle_key(key, entries, state, input_finished, page_size) {
+        KeyAction::Continue => Ok(false),
+        KeyAction::CopySelected => {
+            if let Some(line) = selected_line_text(entries, state) {
+                copy_to_clipboard(&line)?;
+            }
+            Ok(false)
+        }
+        KeyAction::Quit => {
+            terminal.leave()?;
+            Ok(true)
+        }
+        KeyAction::KillAndExit => {
+            let _ = terminal.leave();
+            input.terminate();
+            std::process::exit(130);
+        }
+    }
 }

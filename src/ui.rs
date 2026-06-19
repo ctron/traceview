@@ -265,6 +265,7 @@ pub(crate) enum KeyAction {
     Continue,
     CopySelected,
     Quit,
+    KillAndExit,
 }
 
 pub(crate) fn handle_key(
@@ -275,7 +276,7 @@ pub(crate) fn handle_key(
     page_size: usize,
 ) -> KeyAction {
     if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyAction::Quit;
+        return KeyAction::KillAndExit;
     }
 
     if state.search_editing {
@@ -2839,6 +2840,27 @@ mod tests {
         );
         assert_eq!(state.search_query, "");
         assert!(!state.search_editing);
+    }
+
+    #[test]
+    fn ctrl_c_exits_while_input_is_active_but_q_waits() {
+        let entries = VecDeque::new();
+        let mut state = ViewState::new();
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('q')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &entries,
+                &mut state,
+                false,
+                5,
+            ),
+            KeyAction::KillAndExit
+        );
     }
 
     #[test]

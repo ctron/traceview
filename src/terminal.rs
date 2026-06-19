@@ -26,11 +26,11 @@ impl TerminalGuard {
             .map_err(|_| anyhow!("terminal already left"))
     }
 
-    pub(crate) fn leave(self) -> Result<()> {
+    pub(crate) fn leave(&self) -> Result<()> {
         if let Some(mut stdout) = self.stdout.borrow_mut().take() {
             execute!(stdout, Show, LeaveAlternateScreen)?;
+            disable_raw_mode()?;
         }
-        disable_raw_mode()?;
         Ok(())
     }
 }
