@@ -27,6 +27,7 @@ pub(crate) struct ViewState {
     pub(crate) search_editing: bool,
     pub(crate) search_wrapped: bool,
     pub(crate) focus_target: Option<String>,
+    pub(crate) level_filter: LevelFilter,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +43,34 @@ pub(crate) enum ValuesPaneMode {
     Closed,
     Sidebar,
     Fullscreen,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LevelFilter {
+    #[default]
+    All,
+    AtLeast(Level),
+}
+
+impl LevelFilter {
+    fn includes(self, level: Level) -> bool {
+        match self {
+            Self::All => true,
+            Self::AtLeast(minimum) => level.severity() >= minimum.severity(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::AtLeast(Level::Debug) => "debug+",
+            Self::AtLeast(Level::Info) => "info+",
+            Self::AtLeast(Level::Warn) => "warn+",
+            Self::AtLeast(Level::Error) => "error",
+            Self::AtLeast(Level::Trace) => "trace+",
+            Self::AtLeast(Level::Unknown) => "unknown+",
+        }
+    }
 }
 
 impl ViewState {
@@ -61,6 +90,98 @@ impl ViewState {
     pub(crate) fn remove_first_line(&mut self) {
         self.first_visible = self.first_visible.saturating_sub(1);
         self.selected = self.selected.map(|selected| selected.saturating_sub(1));
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_editing = false;
+        self.search_wrapped = false;
+    }
+
+    fn set_level_filter(
+        &mut self,
+        entries: &VecDeque<LogEntry>,
+        filter: LevelFilter,
+        page_size: usize,
+    ) {
+        self.level_filter = filter;
+        self.search_wrapped = false;
+        self.scroll_selected_into_view(entries, page_size);
+    }
+
+    fn toggle_focus(&mut self, entries: &VecDeque<LogEntry>, page_size: usize) {
+        self.focus_target = if self.focus_target.is_some() {
+            None
+        } else {
+            self.selected
+                .and_then(|selected| entries.get(selected))
+                .and_then(|entry| entry.target.clone())
+        };
+        self.scroll_selected_into_view(entries, page_size);
+    }
+
+    fn start_search(&mut self) {
+        self.close_values_pane();
+        self.search_editing = true;
+        self.search_wrapped = false;
+    }
+
+    fn open_values_sidebar(&mut self, entries: &VecDeque<LogEntry>) {
+        self.clear_search();
+        self.values.mode = ValuesPaneMode::Sidebar;
+        self.sync_values_selection(entries);
+    }
+
+    fn open_values_fullscreen(&mut self, entries: &VecDeque<LogEntry>) {
+        self.clear_search();
+        self.values.mode = ValuesPaneMode::Fullscreen;
+        self.sync_values_selection(entries);
+    }
+
+    fn toggle_values_sidebar(&mut self, entries: &VecDeque<LogEntry>) {
+        if self.values.mode == ValuesPaneMode::Sidebar {
+            self.close_values_pane();
+        } else {
+            self.open_values_sidebar(entries);
+        }
+    }
+
+    fn toggle_values_fullscreen(&mut self, entries: &VecDeque<LogEntry>) {
+        if self.values.mode == ValuesPaneMode::Fullscreen {
+            self.close_values_pane();
+        } else {
+            self.open_values_fullscreen(entries);
+        }
+    }
+
+    fn close_values_pane(&mut self) {
+        self.values.mode = ValuesPaneMode::Closed;
+        self.values.selected = None;
+        self.values.x_offset = 0;
+    }
+
+    fn sync_values_selection(&mut self, entries: &VecDeque<LogEntry>) {
+        let value_count = selected_values_len(entries, self);
+        self.values.selected = match (self.values.selected, value_count) {
+            (_, 0) => None,
+            (Some(selected), count) => Some(cmp::min(selected, count - 1)),
+            (None, _) => Some(0),
+        };
+    }
+
+    fn move_values_selection(&mut self, entries: &VecDeque<LogEntry>, delta: isize) {
+        let value_count = selected_values_len(entries, self);
+        if value_count == 0 {
+            self.values.selected = None;
+            return;
+        }
+
+        let selected = self.values.selected.unwrap_or(0);
+        self.values.selected = Some(if delta.is_negative() {
+            selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            cmp::min(selected.saturating_add(delta as usize), value_count - 1)
+        });
     }
 
     fn move_selected_to(&mut self, visible: &[usize], selected_visible: usize, page_size: usize) {
@@ -164,7 +285,7 @@ fn handle_search_key(
 ) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
-            clear_search(state);
+            state.clear_search();
         }
         KeyCode::Enter => {
             state.search_editing = false;
@@ -204,25 +325,23 @@ fn handle_values_key(
     state: &mut ViewState,
 ) -> KeyAction {
     const PANE_SCROLL_STEP: usize = 16;
-    sync_values_selection(entries, state);
+    state.sync_values_selection(entries);
 
     match key.code {
         KeyCode::Esc => {
-            close_values_pane(state);
+            state.close_values_pane();
         }
         KeyCode::Char('v') => {
-            toggle_values_sidebar(entries, state);
+            state.toggle_values_sidebar(entries);
         }
         KeyCode::Char('V') => {
-            toggle_values_fullscreen(entries, state);
+            state.toggle_values_fullscreen(entries);
         }
         KeyCode::Char('/') => {
-            close_values_pane(state);
-            state.search_editing = true;
-            state.search_wrapped = false;
+            state.start_search();
         }
-        KeyCode::Up => move_values_selection(entries, state, -1),
-        KeyCode::Down => move_values_selection(entries, state, 1),
+        KeyCode::Up => state.move_values_selection(entries, -1),
+        KeyCode::Down => state.move_values_selection(entries, 1),
         KeyCode::Left => {
             state.values.x_offset = state.values.x_offset.saturating_sub(PANE_SCROLL_STEP);
         }
@@ -234,64 +353,6 @@ fn handle_values_key(
     }
 
     KeyAction::Continue
-}
-
-fn open_values_sidebar(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    clear_search(state);
-    state.values.mode = ValuesPaneMode::Sidebar;
-    sync_values_selection(entries, state);
-}
-
-fn open_values_fullscreen(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    clear_search(state);
-    state.values.mode = ValuesPaneMode::Fullscreen;
-    sync_values_selection(entries, state);
-}
-
-fn toggle_values_sidebar(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    if state.values.mode == ValuesPaneMode::Sidebar {
-        close_values_pane(state);
-    } else {
-        open_values_sidebar(entries, state);
-    }
-}
-
-fn toggle_values_fullscreen(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    if state.values.mode == ValuesPaneMode::Fullscreen {
-        close_values_pane(state);
-    } else {
-        open_values_fullscreen(entries, state);
-    }
-}
-
-fn close_values_pane(state: &mut ViewState) {
-    state.values.mode = ValuesPaneMode::Closed;
-    state.values.selected = None;
-    state.values.x_offset = 0;
-}
-
-fn sync_values_selection(entries: &VecDeque<LogEntry>, state: &mut ViewState) {
-    let value_count = selected_values_len(entries, state);
-    state.values.selected = match (state.values.selected, value_count) {
-        (_, 0) => None,
-        (Some(selected), count) => Some(cmp::min(selected, count - 1)),
-        (None, _) => Some(0),
-    };
-}
-
-fn move_values_selection(entries: &VecDeque<LogEntry>, state: &mut ViewState, delta: isize) {
-    let value_count = selected_values_len(entries, state);
-    if value_count == 0 {
-        state.values.selected = None;
-        return;
-    }
-
-    let selected = state.values.selected.unwrap_or(0);
-    state.values.selected = Some(if delta.is_negative() {
-        selected.saturating_sub(delta.unsigned_abs())
-    } else {
-        cmp::min(selected.saturating_add(delta as usize), value_count - 1)
-    });
 }
 
 fn selected_values_len(entries: &VecDeque<LogEntry>, state: &ViewState) -> usize {
@@ -327,9 +388,7 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('/') => {
-            close_values_pane(state);
-            state.search_editing = true;
-            state.search_wrapped = false;
+            state.start_search();
             return KeyAction::Continue;
         }
         KeyCode::Char('n') => {
@@ -348,29 +407,41 @@ fn handle_normal_key(
             state.show_raw = !state.show_raw;
             return KeyAction::Continue;
         }
+        KeyCode::Char('1') => {
+            state.set_level_filter(entries, LevelFilter::All, page_size);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('2') => {
+            state.set_level_filter(entries, LevelFilter::AtLeast(Level::Debug), page_size);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('3') => {
+            state.set_level_filter(entries, LevelFilter::AtLeast(Level::Info), page_size);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('4') => {
+            state.set_level_filter(entries, LevelFilter::AtLeast(Level::Warn), page_size);
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('5') => {
+            state.set_level_filter(entries, LevelFilter::AtLeast(Level::Error), page_size);
+            return KeyAction::Continue;
+        }
         KeyCode::Char('v') => {
-            toggle_values_sidebar(entries, state);
+            state.toggle_values_sidebar(entries);
             return KeyAction::Continue;
         }
         KeyCode::Char('V') => {
-            toggle_values_fullscreen(entries, state);
+            state.toggle_values_fullscreen(entries);
             return KeyAction::Continue;
         }
         KeyCode::Char('f') => {
-            state.focus_target = if state.focus_target.is_some() {
-                None
-            } else {
-                state
-                    .selected
-                    .and_then(|selected| entries.get(selected))
-                    .and_then(|entry| entry.target.clone())
-            };
-            state.scroll_selected_into_view(entries, page_size);
+            state.toggle_focus(entries, page_size);
             return KeyAction::Continue;
         }
         KeyCode::Char('y') => return KeyAction::CopySelected,
         KeyCode::Esc if !state.search_query.is_empty() => {
-            clear_search(state);
+            state.clear_search();
             return KeyAction::Continue;
         }
         KeyCode::Char('q') => {
@@ -398,24 +469,19 @@ fn handle_normal_key(
     KeyAction::Continue
 }
 
-fn clear_search(state: &mut ViewState) {
-    state.search_query.clear();
-    state.search_editing = false;
-    state.search_wrapped = false;
-}
-
 pub(crate) fn draw(
     stdout: &mut impl Write,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
+    input_finished: bool,
 ) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     let content_rows = content_rows(rows, state);
     if state.help_visible {
         queue!(stdout, Hide, Clear(ClearType::All))?;
         draw_help_page(stdout, cols, content_rows)?;
-        let status = status_line(entries, state, exit_status, cols as usize);
+        let status = status_line(entries, state, exit_status, input_finished, cols as usize);
         queue!(
             stdout,
             MoveTo(0, rows.saturating_sub(1)),
@@ -516,7 +582,7 @@ pub(crate) fn draw(
         )?;
     }
 
-    let status = status_line(entries, state, exit_status, cols as usize);
+    let status = status_line(entries, state, exit_status, input_finished, cols as usize);
     queue!(
         stdout,
         MoveTo(0, rows.saturating_sub(1)),
@@ -658,6 +724,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  f               focus selected target, or clear focus",
         "  s               toggle span information",
         "  r               toggle raw log line display",
+        "  1..5            filter all, debug+, info+, warn+, error",
         "  v / V           toggle tracing values pane or fullscreen",
         "  /               search raw log lines",
         "  n / b           jump to next or previous search result",
@@ -962,10 +1029,11 @@ fn selected_entry_for_values<'a>(
 }
 
 fn entry_visible(entry: &LogEntry, state: &ViewState) -> bool {
-    state
-        .focus_target
-        .as_deref()
-        .is_none_or(|target| entry.target.as_deref() == Some(target))
+    state.level_filter.includes(entry.level)
+        && state
+            .focus_target
+            .as_deref()
+            .is_none_or(|target| entry.target.as_deref() == Some(target))
 }
 
 fn selected_visible_pos(visible: &[usize], selected: Option<usize>) -> Option<usize> {
@@ -1009,13 +1077,12 @@ fn jump_to_search_match(
         },
         SearchDirection::Previous => match previous_match_before(&matches, selected) {
             Some(previous) => (previous, false),
-            None => (
-                matches
-                    .last()
-                    .copied()
-                    .expect("matches is known to be non-empty"),
-                selected.is_some(),
-            ),
+            None => {
+                let Some(previous) = matches.last().copied() else {
+                    return;
+                };
+                (previous, selected.is_some())
+            }
         },
     };
 
@@ -1086,62 +1153,107 @@ fn apply_search_highlights(parts: Vec<Part>, query: &str) -> Vec<Part> {
         return parts;
     }
 
-    let text = EntryRenderer::plain_text_from_parts(&parts);
-    let ranges: Vec<_> = text
-        .match_indices(query)
-        .map(|(idx, found)| {
-            let start = text[..idx].chars().count();
-            let end = start + found.chars().count();
-            (start, end)
-        })
-        .collect();
-    if ranges.is_empty() {
+    let Some(highlighter) = SearchHighlighter::new(&parts, query) else {
         return parts;
+    };
+    highlighter.apply(parts)
+}
+
+#[derive(Debug)]
+struct SearchHighlighter {
+    ranges: Vec<(usize, usize)>,
+    range_idx: usize,
+    cursor: usize,
+    highlighted: Vec<Part>,
+}
+
+impl SearchHighlighter {
+    fn new(parts: &[Part], query: &str) -> Option<Self> {
+        let text = EntryRenderer::plain_text_from_parts(parts);
+        let ranges = text
+            .match_indices(query)
+            .map(|(idx, found)| (idx, idx + found.len()))
+            .fold(Vec::new(), |mut ranges: Vec<(usize, usize)>, range| {
+                if let Some(previous) = ranges.last_mut()
+                    && range.0 <= previous.1
+                {
+                    previous.1 = cmp::max(previous.1, range.1);
+                    return ranges;
+                }
+                ranges.push(range);
+                ranges
+            });
+
+        (!ranges.is_empty()).then_some(Self {
+            ranges,
+            range_idx: 0,
+            cursor: 0,
+            highlighted: Vec::new(),
+        })
     }
 
-    let mut highlighted = Vec::new();
-    let mut cursor = 0usize;
+    fn apply(mut self, parts: Vec<Part>) -> Vec<Part> {
+        for part in parts {
+            self.push_part(part);
+        }
+        self.highlighted
+    }
 
-    for part in parts {
-        let part_len = part.text.chars().count();
-        let part_start = cursor;
+    fn push_part(&mut self, part: Part) {
+        let part_len = part.text.len();
+        let part_start = self.cursor;
         let part_end = part_start + part_len;
-        cursor = part_end;
+        self.cursor = part_end;
+
+        while self.range_idx < self.ranges.len() && self.ranges[self.range_idx].1 <= part_start {
+            self.range_idx += 1;
+        }
 
         let mut local_start = 0usize;
+        let mut current_range_idx = self.range_idx;
         while local_start < part_len {
-            let absolute = part_start + local_start;
-            let is_highlighted = ranges
-                .iter()
-                .any(|(start, end)| absolute >= *start && absolute < *end);
-            let local_end = (local_start + 1..=part_len)
-                .find(|candidate| {
-                    let absolute = part_start + *candidate;
-                    let candidate_highlighted = ranges
-                        .iter()
-                        .any(|(start, end)| absolute >= *start && absolute < *end);
-                    candidate_highlighted != is_highlighted
-                })
-                .unwrap_or(part_len);
+            if current_range_idx >= self.ranges.len()
+                || self.ranges[current_range_idx].0 >= part_end
+            {
+                self.push_segment(&part, local_start, part_len, false);
+                break;
+            }
 
-            let text: String = part
-                .text
-                .chars()
-                .skip(local_start)
-                .take(local_end - local_start)
-                .collect();
-            let segment = Part {
-                text,
-                color: part.color,
-                bold: part.bold,
-                highlighted: part.highlighted || is_highlighted,
-            };
-            highlighted.push(segment);
+            let (range_start, range_end) = self.ranges[current_range_idx];
+            if part_start + local_start < range_start {
+                let local_end = range_start - part_start;
+                self.push_segment(&part, local_start, local_end, false);
+                local_start = local_end;
+                continue;
+            }
+
+            let local_end = cmp::min(range_end, part_end) - part_start;
+            self.push_segment(&part, local_start, local_end, true);
             local_start = local_end;
+            if range_end <= part_start + local_start {
+                current_range_idx += 1;
+            }
         }
     }
 
-    highlighted
+    fn push_segment(
+        &mut self,
+        part: &Part,
+        local_start: usize,
+        local_end: usize,
+        highlighted_segment: bool,
+    ) {
+        if local_start == local_end {
+            return;
+        }
+
+        self.highlighted.push(Part {
+            text: part.text[local_start..local_end].to_string(),
+            color: part.color,
+            bold: part.bold,
+            highlighted: part.highlighted || highlighted_segment,
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1685,6 +1797,7 @@ fn status_line(
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
+    input_finished: bool,
     width: usize,
 ) -> String {
     let entry_count = entries.len();
@@ -1696,6 +1809,7 @@ fn status_line(
     };
     let process = match exit_status {
         Some(status) => format!("exited {status}"),
+        None if input_finished => "loaded".to_string(),
         None => "running".to_string(),
     };
     let focus = state
@@ -1703,10 +1817,12 @@ fn status_line(
         .as_deref()
         .map(|target| focus_status(entries, target))
         .unwrap_or_default();
+    let levels = LevelCounts::from_entries(entries, state).summary();
     let search = search_status(entries, state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow} | x={} | spans {} | raw {} | values {}{focus}{search} | ? help ",
+        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | min {} | x={} | spans {} | raw {} | values {} | ? help ",
+        state.level_filter.label(),
         state.x_offset,
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
@@ -1732,6 +1848,49 @@ fn search_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
         "search "
     };
     format!(" | {prefix}{} ({matches} results)", state.search_query)
+}
+
+#[derive(Default)]
+struct LevelCounts {
+    error: usize,
+    warn: usize,
+    info: usize,
+    debug: usize,
+    trace: usize,
+    unknown: usize,
+}
+
+impl LevelCounts {
+    fn from_entries(entries: &VecDeque<LogEntry>, state: &ViewState) -> Self {
+        let mut counts = Self::default();
+        for entry in entries.iter().filter(|entry| {
+            state
+                .focus_target
+                .as_deref()
+                .is_none_or(|target| entry.target.as_deref() == Some(target))
+        }) {
+            counts.add(entry.level);
+        }
+        counts
+    }
+
+    fn add(&mut self, level: Level) {
+        match level {
+            Level::Error => self.error += 1,
+            Level::Warn => self.warn += 1,
+            Level::Info => self.info += 1,
+            Level::Debug => self.debug += 1,
+            Level::Trace => self.trace += 1,
+            Level::Unknown => self.unknown += 1,
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "E{} W{} I{} D{} T{} U{}",
+            self.error, self.warn, self.info, self.debug, self.trace, self.unknown
+        )
+    }
 }
 
 fn focus_status(entries: &VecDeque<LogEntry>, target: &str) -> String {
@@ -2020,6 +2179,34 @@ mod tests {
     }
 
     #[test]
+    fn number_keys_filter_by_minimum_level() {
+        let entries = VecDeque::from([
+            entry_with_level(Level::Trace),
+            entry_with_level(Level::Debug),
+            entry_with_level(Level::Info),
+            entry_with_level(Level::Warn),
+            entry_with_level(Level::Error),
+        ]);
+        let mut state = ViewState {
+            selected: Some(0),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('3')), &entries, &mut state, false, 5);
+        assert_eq!(state.level_filter, LevelFilter::AtLeast(Level::Info));
+        assert_eq!(visible_indices(&entries, &state), vec![2, 3, 4]);
+        assert_eq!(state.selected, Some(4));
+
+        handle_key(key(KeyCode::Char('5')), &entries, &mut state, false, 5);
+        assert_eq!(visible_indices(&entries, &state), vec![4]);
+        assert_eq!(state.selected, Some(4));
+
+        handle_key(key(KeyCode::Char('1')), &entries, &mut state, false, 5);
+        assert_eq!(state.level_filter, LevelFilter::All);
+        assert_eq!(visible_indices(&entries, &state), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn y_requests_copy_selected_line() {
         let entries = entries(1);
         let mut state = ViewState::new();
@@ -2056,6 +2243,16 @@ mod tests {
         let text = String::from_utf8(output).expect("utf8");
 
         assert!(text.contains("r               toggle raw log line display"));
+    }
+
+    #[test]
+    fn help_page_shows_level_filter_shortcuts() {
+        let mut output = Vec::new();
+
+        draw_help_page(&mut output, 80, 8).expect("draw help");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("1..5            filter all, debug+, info+, warn+, error"));
     }
 
     #[test]
@@ -2294,7 +2491,7 @@ mod tests {
         assert_eq!(state.selected, Some(1));
         assert_eq!(search_match_indices(&entries, &state), vec![1, 2]);
 
-        let status = status_line(&entries, &state, None, 120);
+        let status = status_line(&entries, &state, None, false, 120);
         assert!(status.contains("search /er (2 results)"));
     }
 
@@ -2604,6 +2801,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_search_highlights_default_sized_line_with_many_matches_compactly() {
+        let entry = LogEntry {
+            raw: "a".repeat(65_536),
+            timestamp: None,
+            level: Level::Unknown,
+            parsed: false,
+            target: None,
+            spans: Vec::new(),
+            values: Vec::new(),
+            message: "a".repeat(65_536),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        };
+        let state = ViewState {
+            show_raw: true,
+            search_query: "a".to_string(),
+            ..ViewState::new()
+        };
+
+        let parts = EntryRenderer::from(&state).parts(&entry);
+        let highlighted: Vec<_> = parts.iter().filter(|part| part.highlighted).collect();
+
+        assert_eq!(highlighted.len(), 1);
+        assert_eq!(highlighted[0].text.len(), 65_536);
+    }
+
+    #[test]
     fn visible_search_match_is_highlighted_in_parsed_display() {
         let entry = entry_with_target(Some("svc"), "loaded widgets");
         let state = ViewState {
@@ -2681,9 +2905,40 @@ mod tests {
             ..ViewState::new()
         };
 
-        let status = status_line(&entries, &state, None, 120);
+        let status = status_line(&entries, &state, None, false, 120);
 
         assert!(status.contains("focus alpha (2 hidden, 50%)"));
+    }
+
+    #[test]
+    fn status_shows_level_distribution_and_filter() {
+        let entries = VecDeque::from([
+            entry_with_level(Level::Error),
+            entry_with_level(Level::Warn),
+            entry_with_level(Level::Info),
+            entry_with_level(Level::Debug),
+            entry_with_level(Level::Trace),
+            entry_with_level(Level::Unknown),
+        ]);
+        let state = ViewState {
+            level_filter: LevelFilter::AtLeast(Level::Warn),
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, false, 160);
+
+        assert!(status.contains("lvl E1 W1 I1 D1 T1 U1"));
+        assert!(status.contains("min warn+"));
+    }
+
+    #[test]
+    fn status_shows_loaded_after_file_input_finishes() {
+        let entries = entries(1);
+        let state = ViewState::new();
+
+        let status = status_line(&entries, &state, None, true, 120);
+
+        assert!(status.contains(" loaded |"));
     }
 
     #[test]
