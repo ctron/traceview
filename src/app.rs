@@ -23,8 +23,11 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
     if cli.max_lines == Some(0) {
         bail!("--max-lines must be greater than zero");
     }
+    if cli.max_line_bytes == 0 {
+        bail!("--max-line-bytes must be greater than zero");
+    }
 
-    let command = spawn_command(&cli.command)?;
+    let command = spawn_command(&cli.command, cli.max_line_bytes)?;
 
     let terminal = TerminalGuard::enter()?;
     let result = event_loop(&terminal, &command, cli.format, cli.max_lines);

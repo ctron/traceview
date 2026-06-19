@@ -32,11 +32,9 @@ tv -- cargo test
 tv --format tracing -- my-service
 tv --format bunyan -- node service.js
 tv --format logfmt -- ./service
-tv --max-lines 5000 -- ./run.sh
 ```
 
-By default, `traceviewer` attempts to recognize supported formats automatically.
-Use `--format` to choose one explicitly:
+Supported formats:
 
 - `auto`: detect supported formats
 - `plain`: show lines without parsing
@@ -44,6 +42,8 @@ Use `--format` to choose one explicitly:
 - `env-logger`: common `env_logger` text output
 - `logfmt`: key=value records
 - `tracing`: common `tracing` text output
+
+Run `tv --help` for available options.
 
 ## Showcase Example
 
