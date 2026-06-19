@@ -2,6 +2,7 @@ use std::{cmp, collections::VecDeque, io::Write, process::ExitStatus};
 
 use anyhow::Result;
 use crossterm::{
+    SynchronizedUpdate,
     cursor::{Hide, MoveTo},
     event::{KeyCode, KeyEvent, KeyModifiers},
     queue,
@@ -488,6 +489,29 @@ pub(crate) fn draw(
     input_finished: bool,
 ) -> Result<()> {
     let (cols, rows) = terminal::size()?;
+    stdout.sync_update(|stdout| {
+        draw_frame(
+            stdout,
+            entries,
+            state,
+            exit_status,
+            input_finished,
+            cols,
+            rows,
+        )
+    })??;
+    Ok(())
+}
+
+fn draw_frame(
+    stdout: &mut impl Write,
+    entries: &VecDeque<LogEntry>,
+    state: &ViewState,
+    exit_status: Option<ExitStatus>,
+    input_finished: bool,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
     let content_rows = content_rows(rows, state);
     if state.help_visible {
         queue!(stdout, Hide, Clear(ClearType::All))?;
@@ -501,7 +525,6 @@ pub(crate) fn draw(
             cols as usize,
             rows.saturating_sub(1),
         )?;
-        stdout.flush()?;
         return Ok(());
     }
 
@@ -602,7 +625,6 @@ pub(crate) fn draw(
         cols as usize,
         rows.saturating_sub(1),
     )?;
-    stdout.flush()?;
     Ok(())
 }
 
