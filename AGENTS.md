@@ -1,5 +1,9 @@
 # Repository Instructions
 
+## Commits
+
+Use Conventional Commits for commit messages.
+
 ## User-Facing Controls
 
 When adding, removing, or changing a keyboard shortcut:
@@ -21,4 +25,3 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets --tests --bins --all -- -D warnings
 cargo test --locked --all-targets
 ```
-
