@@ -1,3 +1,11 @@
+#![deny(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unwrap_used
+)]
+
 use anyhow::Result;
 use clap::Parser;
 

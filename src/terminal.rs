@@ -1,6 +1,6 @@
 use std::{cell::RefCell, io};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
     execute,
@@ -21,10 +21,9 @@ impl TerminalGuard {
         })
     }
 
-    pub(crate) fn stdout(&self) -> impl std::ops::DerefMut<Target = io::Stdout> + '_ {
-        std::cell::RefMut::map(self.stdout.borrow_mut(), |stdout| {
-            stdout.as_mut().expect("terminal already left")
-        })
+    pub(crate) fn stdout(&self) -> Result<impl std::ops::DerefMut<Target = io::Stdout> + '_> {
+        std::cell::RefMut::filter_map(self.stdout.borrow_mut(), Option::as_mut)
+            .map_err(|_| anyhow!("terminal already left"))
     }
 
     pub(crate) fn leave(self) -> Result<()> {
