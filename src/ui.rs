@@ -78,6 +78,10 @@ impl LevelFilter {
             Self::AtLeast(level) => level_color(level),
         }
     }
+
+    fn highlights_level(self, level: Level) -> bool {
+        matches!(self, Self::AtLeast(_)) && self.includes(level)
+    }
 }
 
 impl ViewState {
@@ -1820,21 +1824,80 @@ fn draw_status_line(
     )?;
 
     if let Some(start) = status.find(filter) {
-        let end = start + filter.len();
+        draw_status_with_highlights(stdout, &status[..start], state)?;
         queue!(
             stdout,
-            Print(&status[..start]),
-            SetForegroundColor(state.level_filter.status_color()),
-            Print(&status[start..end]),
-            SetForegroundColor(status_bar_foreground()),
-            Print(&status[end..]),
-            ResetColor
+            SetForegroundColor(state.level_filter.status_color())
         )?;
+        draw_status_with_highlights(stdout, &status[start..start + filter.len()], state)?;
+        queue!(stdout, SetForegroundColor(status_bar_foreground()))?;
+        draw_status_with_highlights(stdout, &status[start + filter.len()..], state)?;
+        queue!(stdout, ResetColor)?;
     } else {
-        queue!(stdout, Print(status), ResetColor)?;
+        draw_status_with_highlights(stdout, &status, state)?;
+        queue!(stdout, ResetColor)?;
     }
 
     Ok(())
+}
+
+fn draw_status_with_highlights(
+    stdout: &mut impl Write,
+    status: &str,
+    state: &ViewState,
+) -> Result<()> {
+    let Some(levels_start) = status.find("lvl ").map(|start| start + "lvl ".len()) else {
+        queue!(stdout, Print(status))?;
+        return Ok(());
+    };
+    let Some(levels_len) = status[levels_start..].find(" | ") else {
+        queue!(stdout, Print(status))?;
+        return Ok(());
+    };
+
+    let levels_end = levels_start + levels_len;
+    queue!(stdout, Print(&status[..levels_start]))?;
+    draw_level_status(
+        stdout,
+        &status[levels_start..levels_end],
+        state.level_filter,
+    )?;
+    queue!(stdout, Print(&status[levels_end..]))?;
+    Ok(())
+}
+
+fn draw_level_status(stdout: &mut impl Write, levels: &str, filter: LevelFilter) -> Result<()> {
+    for (idx, token) in levels.split(' ').enumerate() {
+        if idx > 0 {
+            queue!(stdout, Print(" "))?;
+        }
+
+        if let Some(level) = token_level(token)
+            && filter.highlights_level(level)
+        {
+            queue!(
+                stdout,
+                SetAttribute(Attribute::Bold),
+                Print(token),
+                SetAttribute(Attribute::NormalIntensity)
+            )?;
+        } else {
+            queue!(stdout, Print(token))?;
+        }
+    }
+    Ok(())
+}
+
+fn token_level(token: &str) -> Option<Level> {
+    match token.as_bytes().first().copied() {
+        Some(b'E') => Some(Level::Error),
+        Some(b'W') => Some(Level::Warn),
+        Some(b'I') => Some(Level::Info),
+        Some(b'D') => Some(Level::Debug),
+        Some(b'T') => Some(Level::Trace),
+        Some(b'?') => Some(Level::Unknown),
+        _ => None,
+    }
 }
 
 fn status_line(
@@ -1926,8 +1989,8 @@ impl LevelCounts {
 
     fn summary(&self) -> String {
         format!(
-            "E{} W{} I{} D{} T{} U{}",
-            self.error, self.warn, self.info, self.debug, self.trace, self.unknown
+            "?{} T{} D{} I{} W{} E{}",
+            self.unknown, self.trace, self.debug, self.info, self.warn, self.error
         )
     }
 }
@@ -2966,8 +3029,47 @@ mod tests {
 
         let status = status_line(&entries, &state, None, false, 160);
 
-        assert!(status.contains("lvl E1 W1 I1 D1 T1 U1"));
+        assert!(status.contains("lvl ?1 T1 D1 I1 W1 E1"));
         assert!(status.contains("| WARN+ |"));
+    }
+
+    #[test]
+    fn status_bolds_levels_in_active_filter() {
+        let entries = VecDeque::from([
+            entry_with_level(Level::Error),
+            entry_with_level(Level::Warn),
+            entry_with_level(Level::Info),
+        ]);
+        let state = ViewState {
+            level_filter: LevelFilter::AtLeast(Level::Warn),
+            ..ViewState::new()
+        };
+        let mut output = Vec::new();
+
+        draw_status_line(&mut output, &entries, &state, None, false, 160, 0).expect("draw status");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(text.contains("\x1b[1mE1\x1b[22m"));
+        assert!(text.contains("\x1b[1mW1\x1b[22m"));
+        assert!(!text.contains("\x1b[1mI1\x1b[22m"));
+    }
+
+    #[test]
+    fn status_does_not_bold_levels_when_showing_all() {
+        let entries = VecDeque::from([
+            entry_with_level(Level::Error),
+            entry_with_level(Level::Warn),
+            entry_with_level(Level::Info),
+        ]);
+        let state = ViewState::new();
+        let mut output = Vec::new();
+
+        draw_status_line(&mut output, &entries, &state, None, false, 160, 0).expect("draw status");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(!text.contains("\x1b[1mE1\x1b[22m"));
+        assert!(!text.contains("\x1b[1mW1\x1b[22m"));
+        assert!(!text.contains("\x1b[1mI1\x1b[22m"));
     }
 
     #[test]
