@@ -22,8 +22,3 @@ cargo clippy --locked --all-targets --tests --bins --all -- -D warnings
 cargo test --locked --all-targets
 ```
 
-If a change affects crates.io packaging or release metadata, also run:
-
-```sh
-cargo publish --dry-run --allow-dirty
-```
