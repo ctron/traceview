@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, MoveTo},
-    event::{KeyCode, KeyEvent, KeyModifiers},
+    event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind},
     queue,
     style::{
         Attribute, Color, Print, PrintStyledContent, ResetColor, SetAttribute, SetBackgroundColor,
@@ -290,6 +290,28 @@ pub(crate) fn handle_key(
     handle_normal_key(key, entries, state, process_exited, page_size)
 }
 
+pub(crate) fn handle_mouse(
+    mouse: MouseEvent,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    process_exited: bool,
+    page_size: usize,
+) -> KeyAction {
+    let key = match mouse.kind {
+        MouseEventKind::ScrollUp => KeyCode::Up,
+        MouseEventKind::ScrollDown => KeyCode::Down,
+        _ => return KeyAction::Continue,
+    };
+
+    handle_key(
+        KeyEvent::new(key, KeyModifiers::NONE),
+        entries,
+        state,
+        process_exited,
+        page_size,
+    )
+}
+
 fn handle_search_key(
     key: KeyEvent,
     entries: &VecDeque<LogEntry>,
@@ -457,10 +479,8 @@ fn handle_normal_key(
             state.clear_search();
             return KeyAction::Continue;
         }
-        KeyCode::Char('q') => {
-            if process_exited {
-                return KeyAction::Quit;
-            }
+        KeyCode::Char('q') if process_exited => {
+            return KeyAction::Quit;
         }
         KeyCode::Left => {
             state.x_offset = state.x_offset.saturating_sub(HORIZONTAL_SCROLL_STEP);
@@ -774,6 +794,7 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  Home / Pos1     move cursor to first retained line",
         "  End             move cursor to last retained line",
         "  Left / Right    scroll horizontally, or scroll values pane",
+        "  Mouse wheel     move cursor vertically",
     ];
 
     for (row, line) in lines.iter().take(content_rows).enumerate() {
@@ -2266,6 +2287,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn renderer() -> EntryRenderer {
         EntryRenderer {
             options: RenderOptions {
@@ -2301,6 +2331,66 @@ mod tests {
 
         handle_key(key(KeyCode::PageDown), &entries, &mut state, false, 6);
         assert_eq!(state.selected, Some(19));
+    }
+
+    #[test]
+    fn mouse_wheel_moves_selection_and_scrolls_viewport() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            selected: Some(4),
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_mouse(
+                mouse(MouseEventKind::ScrollDown),
+                &entries,
+                &mut state,
+                false,
+                5,
+            ),
+            KeyAction::Continue
+        );
+        assert_eq!(state.selected, Some(5));
+        assert_eq!(state.first_visible, 1);
+
+        handle_mouse(
+            mouse(MouseEventKind::ScrollUp),
+            &entries,
+            &mut state,
+            false,
+            5,
+        );
+        assert_eq!(state.selected, Some(4));
+        assert_eq!(state.first_visible, 1);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_value_selection_when_pane_is_open() {
+        let entries = VecDeque::from([entry_with_values(vec![
+            TraceValueField::new("id", TraceValue::Number("7".to_string())),
+            TraceValueField::new("tag", TraceValue::String("admin".to_string())),
+        ])]);
+        let mut state = ViewState {
+            selected: Some(0),
+            values: ValuesPaneState {
+                mode: ValuesPaneMode::Sidebar,
+                selected: Some(0),
+                ..ValuesPaneState::default()
+            },
+            ..ViewState::new()
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::ScrollDown),
+            &entries,
+            &mut state,
+            false,
+            5,
+        );
+
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.values.selected, Some(1));
     }
 
     #[test]

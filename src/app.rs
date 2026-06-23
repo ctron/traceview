@@ -17,7 +17,7 @@ use crate::{
     parser::parse_log_line,
     process::{InputSource, RunningInput, spawn_input},
     terminal::TerminalGuard,
-    ui::{KeyAction, ViewState, content_rows, draw, handle_key, selected_line_text},
+    ui::{KeyAction, ViewState, content_rows, draw, handle_key, handle_mouse, selected_line_text},
 };
 
 const MAX_EVENTS_PER_TICK: usize = 1024;
@@ -53,11 +53,9 @@ fn event_loop(
     loop {
         let page_size = content_rows(terminal::size()?.1, &state);
 
-        if event::poll(Duration::ZERO)?
-            && let Event::Key(key) = event::read()?
-        {
-            if handle_terminal_key(
-                key,
+        if event::poll(Duration::ZERO)? {
+            if handle_terminal_event(
+                event::read()?,
                 terminal,
                 input,
                 &entries,
@@ -124,11 +122,9 @@ fn event_loop(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if handle_terminal_key(
-                key,
+        if event::poll(Duration::from_millis(50))? {
+            if handle_terminal_event(
+                event::read()?,
                 terminal,
                 input,
                 &entries,
@@ -140,6 +136,34 @@ fn event_loop(
             }
             dirty = true;
         }
+    }
+}
+
+fn handle_terminal_event(
+    event: Event,
+    terminal: &TerminalGuard,
+    input: &RunningInput,
+    entries: &VecDeque<LogEntry>,
+    state: &mut ViewState,
+    input_finished: bool,
+    page_size: usize,
+) -> Result<bool> {
+    match event {
+        Event::Key(key) => handle_terminal_key(
+            key,
+            terminal,
+            input,
+            entries,
+            state,
+            input_finished,
+            page_size,
+        ),
+        Event::Mouse(mouse) => {
+            let action = handle_mouse(mouse, entries, state, input_finished, page_size);
+            debug_assert_eq!(action, KeyAction::Continue);
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
