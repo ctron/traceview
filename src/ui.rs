@@ -4,13 +4,48 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
 use crate::model::{Level, LogEntry, MessagePart, Stream, TraceValue, TraceValueField};
+
+const STATUS_BAR_FOREGROUND: Color = Color::Black;
+const STATUS_BAR_BACKGROUND: Color = Color::White;
+const SELECTED_BACKGROUND: Color = Color::Rgb(64, 64, 64);
+const SEARCH_MATCH_BACKGROUND: Color = Color::LightYellow;
+const SEARCH_MATCH_FOREGROUND: Color = Color::Black;
+const STRING_COLOR: Color = Color::Rgb(206, 145, 120);
+const SPAN_KEY_COLOR: Color = Color::Rgb(156, 220, 254);
+const SPAN_PUNCTUATION_COLOR: Color = Color::Rgb(150, 150, 150);
+
+const HELP_LINES: &[&str] = &[
+    "tv help",
+    "",
+    "Actions",
+    "  f               focus selected target, or clear focus",
+    "  s               toggle span information",
+    "  r               toggle raw log line display",
+    "  1..5            filter all, debug+, info+, warn+, error",
+    "  v / V           toggle tracing values pane or fullscreen",
+    "  /               search raw log lines",
+    "  n / b           jump to next or previous search result",
+    "  Esc             clear search, close help, or close values pane",
+    "  y               copy selected line or value to clipboard",
+    "  ?               toggle this help page",
+    "  q               exit after the process ends",
+    "  Ctrl-C          kill process and exit",
+    "",
+    "Navigation",
+    "  Up / Down       move cursor one line",
+    "  PgUp / PgDown   move cursor one page",
+    "  Home / Pos1     move cursor to first retained line",
+    "  End             move cursor to last retained line",
+    "  Left / Right    scroll horizontally, or scroll values pane",
+    "  Mouse wheel     move cursor vertically",
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct ViewState {
@@ -51,14 +86,14 @@ pub(crate) enum LevelFilter {
 }
 
 impl LevelFilter {
-    fn includes(self, level: Level) -> bool {
+    const fn includes(self, level: Level) -> bool {
         match self {
             Self::All => true,
             Self::AtLeast(minimum) => level.severity() >= minimum.severity(),
         }
     }
 
-    fn status_label(self) -> &'static str {
+    const fn status_label(self) -> &'static str {
         match self {
             Self::All => "ALL",
             Self::AtLeast(Level::Debug) => "DEBUG+",
@@ -70,14 +105,14 @@ impl LevelFilter {
         }
     }
 
-    fn status_color(self) -> Color {
+    const fn status_color(self) -> Color {
         match self {
-            Self::All => status_bar_foreground(),
+            Self::All => STATUS_BAR_FOREGROUND,
             Self::AtLeast(level) => level_color(level),
         }
     }
 
-    fn highlights_level(self, level: Level) -> bool {
+    const fn highlights_level(self, level: Level) -> bool {
         matches!(self, Self::AtLeast(_)) && self.includes(level)
     }
 }
@@ -506,15 +541,35 @@ pub(crate) fn draw(
     exit_status: Option<ExitStatus>,
     input_finished: bool,
 ) {
-    let area = frame.area();
-    draw_frame(
-        frame.buffer_mut(),
-        area,
-        entries,
-        state,
-        exit_status,
-        input_finished,
+    frame.render_widget(
+        TraceViewerWidget {
+            entries,
+            state,
+            exit_status,
+            input_finished,
+        },
+        frame.area(),
     );
+}
+
+struct TraceViewerWidget<'a> {
+    entries: &'a VecDeque<LogEntry>,
+    state: &'a ViewState,
+    exit_status: Option<ExitStatus>,
+    input_finished: bool,
+}
+
+impl Widget for TraceViewerWidget<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        draw_frame(
+            buffer,
+            area,
+            self.entries,
+            self.state,
+            self.exit_status,
+            self.input_finished,
+        );
+    }
 }
 
 fn draw_frame(
@@ -525,38 +580,62 @@ fn draw_frame(
     exit_status: Option<ExitStatus>,
     input_finished: bool,
 ) {
-    let Rect {
-        width: cols,
-        height: rows,
-        ..
-    } = area;
-    let content_rows = content_rows(rows, state);
+    let [main_area, status_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     if state.help_visible {
-        draw_help_page(buffer, cols, content_rows);
+        let [help_area, _] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(u16::from(search_bar_visible(state))),
+        ])
+        .areas(main_area);
+        draw_help_page(buffer, help_area);
         draw_status_line(
             buffer,
+            status_area,
             entries,
             state,
             exit_status,
             input_finished,
-            cols as usize,
-            rows.saturating_sub(1),
         );
         return;
     }
 
-    let top_bar_rows = usize::from(search_bar_visible(state));
-    let scrollbar_width = usize::from(cols > 1 && content_rows > 0);
-    let pane_width = values_pane_width(cols as usize, &state.values);
-    let pane_gap = usize::from(pane_width > 0);
-    let log_width = if state.values.mode == ValuesPaneMode::Fullscreen {
-        0
+    let [search_area, content_area] = if search_bar_visible(state) {
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main_area)
     } else {
-        (cols as usize)
-            .saturating_sub(scrollbar_width)
-            .saturating_sub(pane_width)
-            .saturating_sub(pane_gap)
+        [
+            Rect::new(main_area.x, main_area.y, main_area.width, 0),
+            main_area,
+        ]
     };
+    let content_rows = content_area.height as usize;
+
+    if search_bar_visible(state) {
+        draw_search_bar(buffer, search_area, entries, state);
+    }
+
+    let pane_width = values_pane_width(content_area.width as usize, &state.values) as u16;
+    let (log_area, scrollbar_area, pane_area) = match state.values.mode {
+        ValuesPaneMode::Fullscreen => (Rect::default(), Rect::default(), content_area),
+        ValuesPaneMode::Sidebar if pane_width > 0 => {
+            let [log, scrollbar, _, pane] = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(pane_width),
+            ])
+            .areas(content_area);
+            (log, scrollbar, pane)
+        }
+        ValuesPaneMode::Closed | ValuesPaneMode::Sidebar => {
+            let scrollbar_width = u16::from(content_area.width > 1 && content_area.height > 0);
+            let [log, scrollbar] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(scrollbar_width)])
+                    .areas(content_area);
+            (log, scrollbar, Rect::default())
+        }
+    };
+
     let visible = visible_indices(entries, state);
     let selected = state
         .selected
@@ -573,29 +652,26 @@ fn draw_frame(
         });
     let end_pos = cmp::min(start_pos + content_rows, visible.len());
 
-    if search_bar_visible(state) {
-        draw_search_bar(buffer, entries, state, cols as usize);
+    for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
+        let Some(entry) = entries.get(idx) else {
+            continue;
+        };
+        let is_selected = Some(idx) == selected;
+        render_entry_line(
+            buffer,
+            Rect::new(
+                log_area.x,
+                log_area.y + screen_row as u16,
+                log_area.width,
+                1,
+            ),
+            EntryRenderer::from(state).line(entry, is_selected),
+            state.x_offset,
+            is_selected,
+        );
     }
 
-    if state.values.mode != ValuesPaneMode::Fullscreen {
-        for (screen_row, idx) in visible[start_pos..end_pos].iter().copied().enumerate() {
-            let Some(entry) = entries.get(idx) else {
-                continue;
-            };
-            let line = EntryRenderer::from(state).line(
-                entry,
-                state.x_offset,
-                log_width,
-                Some(idx) == selected,
-            );
-            Paragraph::new(line).render(
-                Rect::new(0, (screen_row + top_bar_rows) as u16, log_width as u16, 1),
-                buffer,
-            );
-        }
-    }
-
-    if scrollbar_width > 0 && state.values.mode != ValuesPaneMode::Fullscreen {
+    if scrollbar_area.width > 0 {
         draw_scrollbar(
             buffer,
             entries,
@@ -603,44 +679,23 @@ fn draw_frame(
             ScrollbarViewport {
                 visible_start: start_pos,
                 visible_end: end_pos,
-                height: content_rows,
-                top_row: top_bar_rows,
-                column: cols
-                    .saturating_sub(1)
-                    .saturating_sub(pane_width as u16)
-                    .saturating_sub(pane_gap as u16),
+                area: scrollbar_area,
             },
         );
     }
 
-    if pane_width > 0 {
-        let pane_left = if state.values.mode == ValuesPaneMode::Fullscreen {
-            0
-        } else {
-            cols as usize - pane_width
-        };
+    if pane_area.width > 0 {
         let selected_entry = selected.and_then(|idx| entries.get(idx));
-        draw_values_pane(
-            buffer,
-            selected_entry,
-            &state.values,
-            PaneViewport {
-                left: pane_left,
-                top: top_bar_rows,
-                width: pane_width,
-                height: content_rows,
-            },
-        );
+        draw_values_pane(buffer, selected_entry, &state.values, pane_area);
     }
 
     draw_status_line(
         buffer,
+        status_area,
         entries,
         state,
         exit_status,
         input_finished,
-        cols as usize,
-        rows.saturating_sub(1),
     );
 }
 
@@ -654,9 +709,9 @@ fn search_bar_visible(state: &ViewState) -> bool {
 
 fn draw_search_bar(
     buffer: &mut Buffer,
+    area: Rect,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
-    width: usize,
 ) {
     let matches = search_match_indices(entries, state);
     let results = search_result_summary(&matches, state.selected, state.search_wrapped);
@@ -670,27 +725,17 @@ fn draw_search_bar(
         state.search_query
     );
     let (foreground, background) = search_bar_colors(state.search_editing);
-    Paragraph::new(Span::styled(
-        visible_slice(&format!("{bar:<width$}"), 0, width),
-        Style::default().fg(foreground).bg(background),
-    ))
-    .render(Rect::new(0, 0, width as u16, 1), buffer);
+    Paragraph::new(bar)
+        .style(Style::default().fg(foreground).bg(background))
+        .render(area, buffer);
 }
 
-fn search_bar_colors(editing: bool) -> (Color, Color) {
+const fn search_bar_colors(editing: bool) -> (Color, Color) {
     if editing {
         (Color::Black, Color::Rgb(150, 205, 255))
     } else {
         (Color::Black, Color::White)
     }
-}
-
-fn status_bar_foreground() -> Color {
-    Color::Black
-}
-
-fn status_bar_background() -> Color {
-    Color::White
 }
 
 fn search_result_summary(matches: &[usize], selected: Option<usize>, wrapped: bool) -> String {
@@ -723,9 +768,7 @@ fn result_count_label(count: usize) -> String {
 struct ScrollbarViewport {
     visible_start: usize,
     visible_end: usize,
-    height: usize,
-    top_row: usize,
-    column: u16,
+    area: Rect,
 }
 
 fn draw_scrollbar(
@@ -734,8 +777,8 @@ fn draw_scrollbar(
     visible_indices: &[usize],
     viewport: ScrollbarViewport,
 ) {
-    for row in 0..viewport.height {
-        let slice = ScrollbarSlice::new(row, viewport.height, visible_indices.len());
+    for row in 0..viewport.area.height as usize {
+        let slice = ScrollbarSlice::new(row, viewport.area.height as usize, visible_indices.len());
         let in_view = slice.start < viewport.visible_end && slice.end > viewport.visible_start;
         let color = scrollbar_slice_color(entries, visible_indices, slice.start, slice.end);
         let marker = if in_view { '#' } else { '|' };
@@ -744,51 +787,21 @@ fn draw_scrollbar(
             style = style.add_modifier(Modifier::BOLD);
         }
 
-        if let Some(cell) = buffer.cell_mut((viewport.column, (row + viewport.top_row) as u16)) {
+        if let Some(cell) = buffer.cell_mut((viewport.area.x, viewport.area.y + row as u16)) {
             cell.set_char(marker).set_style(style);
         }
     }
 }
 
-fn draw_help_page(buffer: &mut Buffer, cols: u16, content_rows: usize) {
-    let lines = [
-        "tv help",
-        "",
-        "Actions",
-        "  f               focus selected target, or clear focus",
-        "  s               toggle span information",
-        "  r               toggle raw log line display",
-        "  1..5            filter all, debug+, info+, warn+, error",
-        "  v / V           toggle tracing values pane or fullscreen",
-        "  /               search raw log lines",
-        "  n / b           jump to next or previous search result",
-        "  Esc             clear search, close help, or close values pane",
-        "  y               copy selected line or value to clipboard",
-        "  ?               toggle this help page",
-        "  q               exit after the process ends",
-        "  Ctrl-C          kill process and exit",
-        "",
-        "Navigation",
-        "  Up / Down       move cursor one line",
-        "  PgUp / PgDown   move cursor one page",
-        "  Home / Pos1     move cursor to first retained line",
-        "  End             move cursor to last retained line",
-        "  Left / Right    scroll horizontally, or scroll values pane",
-        "  Mouse wheel     move cursor vertically",
-    ];
-
-    let lines = lines.iter().take(content_rows).map(|line| {
+fn draw_help_page(buffer: &mut Buffer, area: Rect) {
+    let lines = HELP_LINES.iter().take(area.height as usize).map(|line| {
         let color = match *line {
             "tv help" | "Navigation" | "Actions" => Color::LightCyan,
             _ => Color::White,
         };
-        Line::styled(
-            visible_slice(line, 0, cols as usize),
-            Style::default().fg(color),
-        )
+        Line::styled(*line, Style::default().fg(color))
     });
-    Paragraph::new(lines.collect::<Vec<_>>())
-        .render(Rect::new(0, 0, cols, content_rows as u16), buffer);
+    Paragraph::new(lines.collect::<Vec<_>>()).render(area, buffer);
 }
 
 pub(crate) fn selected_line_text(
@@ -811,14 +824,6 @@ fn selected_value_text(entries: &VecDeque<LogEntry>, state: &ViewState) -> Optio
     Some(format!("{} = {}", value.key, value.value.render_text()))
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PaneViewport {
-    left: usize,
-    top: usize,
-    width: usize,
-    height: usize,
-}
-
 fn values_pane_width(cols: usize, state: &ValuesPaneState) -> usize {
     match state.mode {
         ValuesPaneMode::Closed => 0,
@@ -832,46 +837,56 @@ fn draw_values_pane(
     buffer: &mut Buffer,
     entry: Option<&LogEntry>,
     state: &ValuesPaneState,
-    viewport: PaneViewport,
+    area: Rect,
 ) {
-    if viewport.width == 0 || viewport.height == 0 {
+    if area.is_empty() {
         return;
     }
 
-    for row in 0..viewport.height {
-        let text_width = viewport.width.saturating_sub(1);
-        let content = match row {
-            0 => Line::from(padded_span(
-                "Tracing values",
-                0,
-                text_width,
-                Color::LightCyan,
+    let [separator_area, content_area] =
+        Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    for row in 0..area.height {
+        Span::styled("|", Style::default().fg(Color::DarkGray)).render(
+            Rect::new(separator_area.x, separator_area.y + row, 1, 1),
+            buffer,
+        );
+
+        let (content, selected, scroll) = match row {
+            0 => (
+                Line::styled(
+                    "Tracing values",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 false,
-                true,
-            )),
-            row => match entry.and_then(|entry| values_pane_row(entry, row - 1)) {
-                Some(ValuesPaneRow::Section(title)) => Line::from(padded_span(
-                    title,
-                    0,
-                    text_width,
-                    Color::LightCyan,
+                0,
+            ),
+            row => match entry.and_then(|entry| values_pane_row(entry, (row - 1) as usize)) {
+                Some(ValuesPaneRow::Section(title)) => (
+                    Line::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     false,
-                    true,
-                )),
+                    0,
+                ),
                 Some(ValuesPaneRow::Field { index, field }) => {
                     let selected = state.selected == Some(index);
-                    value_row(
-                        &field.key,
-                        &field.value.render_text(),
-                        trace_value_color(&field.value),
-                        state.x_offset,
-                        text_width,
+                    (
+                        value_line(
+                            &field.key,
+                            &field.value.render_text(),
+                            trace_value_color(&field.value),
+                            selected,
+                        ),
                         selected,
+                        state.x_offset,
                     )
                 }
-                Some(ValuesPaneRow::Spacer) => {
-                    Line::from(padded_span("", 0, text_width, Color::White, false, false))
-                }
+                Some(ValuesPaneRow::Spacer) => (Line::default(), false, 0),
                 None => {
                     let empty_label =
                         if row == 1 && entry.is_none_or(|entry| value_field_count(entry) == 0) {
@@ -879,29 +894,26 @@ fn draw_values_pane(
                         } else {
                             ""
                         };
-                    Line::from(padded_span(
-                        empty_label,
+                    (
+                        Line::styled(empty_label, Style::default().fg(Color::White)),
+                        false,
                         0,
-                        text_width,
-                        Color::White,
-                        false,
-                        false,
-                    ))
+                    )
                 }
             },
         };
-        let mut spans = vec![Span::styled("|", Style::default().fg(Color::DarkGray))];
-        spans.extend(content.spans);
-        let line = Line::from(spans);
-        Paragraph::new(line).render(
-            Rect::new(
-                viewport.left as u16,
-                (viewport.top + row) as u16,
-                viewport.width as u16,
-                1,
-            ),
-            buffer,
-        );
+        let style = if selected {
+            Style::default().bg(SELECTED_BACKGROUND)
+        } else {
+            Style::default()
+        };
+        Paragraph::new(content)
+            .style(style)
+            .scroll((0, horizontal_offset(scroll)))
+            .render(
+                Rect::new(content_area.x, content_area.y + row, content_area.width, 1),
+                buffer,
+            );
     }
 }
 
@@ -967,68 +979,12 @@ fn value_field_count(entry: &LogEntry) -> usize {
         .sum()
 }
 
-fn value_row(
-    key: &str,
-    value: &str,
-    value_color: Color,
-    x_offset: usize,
-    width: usize,
-    selected: bool,
-) -> Line<'static> {
+fn value_line(key: &str, value: &str, value_color: Color, selected: bool) -> Line<'static> {
     let prefix = format!("{key} = ");
-    let prefix_width = prefix.chars().count();
-    let mut spans = Vec::new();
-
-    if x_offset < prefix_width {
-        let prefix_width = cmp::min(prefix_width - x_offset, width);
-        spans.push(padded_span(
-            &prefix,
-            x_offset,
-            prefix_width,
-            Color::White,
-            selected,
-            false,
-        ));
-        spans.push(padded_span(
-            value,
-            0,
-            width.saturating_sub(prefix_width),
-            value_color,
-            selected,
-            false,
-        ));
-    } else {
-        spans.push(padded_span(
-            value,
-            x_offset - prefix_width,
-            width,
-            value_color,
-            selected,
-            false,
-        ));
-    }
-
-    Line::from(spans)
-}
-
-fn padded_span(
-    text: &str,
-    x_offset: usize,
-    width: usize,
-    color: Color,
-    selected: bool,
-    bold: bool,
-) -> Span<'static> {
-    let text = visible_slice(text, x_offset, width);
-    let background = if selected {
-        selected_background()
-    } else {
-        Color::Reset
-    };
-    Span::styled(
-        format!("{text:<width$}"),
-        apply_style(color, bold).bg(background),
-    )
+    Line::from(vec![
+        styled_span(prefix, Color::White, false, false, selected),
+        styled_span(value.to_string(), value_color, false, false, selected),
+    ])
 }
 
 fn trace_value_color(value: &TraceValue) -> Color {
@@ -1301,86 +1257,15 @@ impl EntryRenderer {
         }
     }
 
-    fn line(
-        self,
-        entry: &LogEntry,
-        x_offset: usize,
-        width: usize,
-        selected: bool,
-    ) -> Line<'static> {
-        let parts = self.parts(entry);
-        let rendered = Self::plain_text_from_parts(&parts);
-        let rendered_width = rendered.chars().count();
-        if width == 0 {
-            return Line::default();
-        }
-
-        let viewport = LineViewport::new(rendered_width, x_offset, width);
-        let content_width = viewport.content_width;
-        let visible = visible_slice(&rendered, x_offset, content_width);
-        let mut cursor = 0usize;
-        let mut spans = Vec::new();
-
-        if viewport.show_left_marker {
-            spans.push(styled_span(
-                "<".to_string(),
-                Color::DarkGray,
-                true,
-                false,
-                selected,
-            ));
-        }
-
-        for part in parts {
-            let part_start = cursor;
-            let part_end = cursor + part.text.chars().count();
-            cursor = part_end;
-
-            let overlap_start = cmp::max(part_start, x_offset);
-            let overlap_end = cmp::min(part_end, x_offset.saturating_add(content_width));
-            if overlap_start >= overlap_end {
-                continue;
-            }
-
-            let local_start = overlap_start - part_start;
-            let local_len = overlap_end - overlap_start;
-            let segment: String = part
-                .text
-                .chars()
-                .skip(local_start)
-                .take(local_len)
-                .collect();
-            spans.push(styled_span(
-                segment,
-                part.color,
-                part.bold,
-                part.highlighted,
-                selected,
-            ));
-        }
-
-        let remaining = content_width.saturating_sub(visible.chars().count());
-        if remaining > 0 {
-            spans.push(styled_span(
-                " ".repeat(remaining),
-                Color::White,
-                false,
-                false,
-                selected,
-            ));
-        }
-
-        if viewport.show_right_marker {
-            spans.push(styled_span(
-                ">".to_string(),
-                Color::DarkGray,
-                true,
-                false,
-                selected,
-            ));
-        }
-
-        Line::from(spans)
+    fn line(self, entry: &LogEntry, selected: bool) -> Line<'static> {
+        Line::from(
+            self.parts(entry)
+                .into_iter()
+                .map(|part| {
+                    styled_span(part.text, part.color, part.bold, part.highlighted, selected)
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn plain_text(&self, entry: &LogEntry) -> String {
@@ -1488,7 +1373,7 @@ impl EntryRenderer {
                         token.push(next);
                     }
                 } else if ch == '"' {
-                    parts.push(Part::new(std::mem::take(&mut token), string_color(), false));
+                    parts.push(Part::new(std::mem::take(&mut token), STRING_COLOR, false));
                     in_string = false;
                     expecting_value = false;
                 }
@@ -1503,13 +1388,13 @@ impl EntryRenderer {
                 }
                 '=' | ':' => {
                     flush_span_token(parts, &mut token, expecting_key, expecting_value);
-                    parts.push(Part::new(ch.to_string(), span_punctuation_color(), false));
+                    parts.push(Part::new(ch.to_string(), SPAN_PUNCTUATION_COLOR, false));
                     expecting_key = false;
                     expecting_value = true;
                 }
                 '{' | '}' | '(' | ')' | '[' | ']' | ',' => {
                     flush_span_token(parts, &mut token, expecting_key, expecting_value);
-                    parts.push(Part::new(ch.to_string(), span_punctuation_color(), false));
+                    parts.push(Part::new(ch.to_string(), SPAN_PUNCTUATION_COLOR, false));
                     expecting_key = matches!(ch, '{' | ',' | '(');
                     expecting_value = false;
                 }
@@ -1526,11 +1411,55 @@ impl EntryRenderer {
         }
 
         if in_string {
-            parts.push(Part::new(token, string_color(), false));
+            parts.push(Part::new(token, STRING_COLOR, false));
         } else {
             flush_span_token(parts, &mut token, expecting_key, expecting_value);
         }
     }
+}
+
+fn render_entry_line(
+    buffer: &mut Buffer,
+    area: Rect,
+    line: Line<'static>,
+    x_offset: usize,
+    selected: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let line_width = line.width();
+    let show_left_marker = x_offset > 0;
+    let mut content_area = area;
+    if show_left_marker {
+        styled_span("<".to_string(), Color::DarkGray, true, false, selected)
+            .render(Rect::new(area.x, area.y, 1, 1), buffer);
+        content_area.x = content_area.x.saturating_add(1);
+        content_area.width = content_area.width.saturating_sub(1);
+    }
+
+    let show_right_marker =
+        content_area.width > 0 && line_width > x_offset.saturating_add(content_area.width as usize);
+    if show_right_marker {
+        content_area.width = content_area.width.saturating_sub(1);
+        styled_span(">".to_string(), Color::DarkGray, true, false, selected)
+            .render(Rect::new(content_area.right(), area.y, 1, 1), buffer);
+    }
+
+    let style = if selected {
+        Style::default().bg(SELECTED_BACKGROUND)
+    } else {
+        Style::default()
+    };
+    Paragraph::new(line)
+        .style(style)
+        .scroll((0, horizontal_offset(x_offset)))
+        .render(content_area, buffer);
+}
+
+fn horizontal_offset(offset: usize) -> u16 {
+    cmp::min(offset, u16::MAX as usize) as u16
 }
 
 fn flush_span_token(
@@ -1544,7 +1473,7 @@ fn flush_span_token(
     }
 
     let color = if expecting_key {
-        span_key_color()
+        SPAN_KEY_COLOR
     } else if expecting_value {
         span_value_color(token)
     } else {
@@ -1591,11 +1520,7 @@ impl EntryRenderer {
             }
 
             if in_string {
-                parts.push(Part::new(
-                    std::mem::take(&mut current),
-                    string_color(),
-                    false,
-                ));
+                parts.push(Part::new(std::mem::take(&mut current), STRING_COLOR, false));
                 in_string = false;
             } else {
                 if current.len() > ch.len_utf8() {
@@ -1608,11 +1533,7 @@ impl EntryRenderer {
         }
 
         if !current.is_empty() {
-            let color = if in_string {
-                string_color()
-            } else {
-                base_color
-            };
+            let color = if in_string { STRING_COLOR } else { base_color };
             parts.push(Part::new(current, color, false));
         }
     }
@@ -1698,29 +1619,6 @@ impl EntryRenderer {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct LineViewport {
-    content_width: usize,
-    show_left_marker: bool,
-    show_right_marker: bool,
-}
-
-impl LineViewport {
-    fn new(line_width: usize, x_offset: usize, terminal_width: usize) -> Self {
-        let show_left_marker = x_offset > 0 && terminal_width > 1;
-        let mut content_width = terminal_width.saturating_sub(usize::from(show_left_marker));
-        let show_right_marker =
-            line_width > x_offset.saturating_add(content_width) && content_width > 0;
-        content_width = content_width.saturating_sub(usize::from(show_right_marker));
-
-        Self {
-            content_width,
-            show_left_marker,
-            show_right_marker,
-        }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
 struct ScrollbarSlice {
     start: usize,
     end: usize,
@@ -1751,11 +1649,11 @@ fn styled_span(
 ) -> Span<'static> {
     let style = if highlighted {
         Style::default()
-            .bg(search_match_background())
-            .fg(search_match_foreground())
+            .bg(SEARCH_MATCH_BACKGROUND)
+            .fg(SEARCH_MATCH_FOREGROUND)
     } else if selected {
         Style::default()
-            .bg(selected_background())
+            .bg(SELECTED_BACKGROUND)
             .fg(selected_foreground(color))
     } else {
         Style::default().fg(color)
@@ -1769,27 +1667,7 @@ fn styled_span(
     Span::styled(text, style)
 }
 
-fn apply_style(color: Color, bold: bool) -> Style {
-    let mut style = Style::default().fg(color);
-    if bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    style
-}
-
-fn selected_background() -> Color {
-    Color::Rgb(64, 64, 64)
-}
-
-fn search_match_background() -> Color {
-    Color::LightYellow
-}
-
-fn search_match_foreground() -> Color {
-    Color::Black
-}
-
-fn selected_foreground(color: Color) -> Color {
+const fn selected_foreground(color: Color) -> Color {
     match color {
         Color::LightRed => Color::Red,
         Color::LightYellow => Color::Yellow,
@@ -1803,14 +1681,13 @@ fn selected_foreground(color: Color) -> Color {
 
 fn draw_status_line(
     buffer: &mut Buffer,
+    area: Rect,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     input_finished: bool,
-    width: usize,
-    row: u16,
 ) {
-    let status = status_line(entries, state, exit_status, input_finished, width);
+    let status = status_line(entries, state, exit_status, input_finished);
     let filter = state.level_filter.status_label();
     let filter_range = status
         .find(filter)
@@ -1833,25 +1710,43 @@ fn draw_status_line(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let spans = status
-        .char_indices()
-        .map(|(index, ch)| {
-            let foreground =
-                if filter_range.is_some_and(|(start, end)| index >= start && index < end) {
-                    state.level_filter.status_color()
-                } else {
-                    status_bar_foreground()
-                };
-            let mut style = Style::default().fg(foreground).bg(status_bar_background());
-            if level_ranges.iter().any(|(start, end, level)| {
-                index >= *start && index < *end && state.level_filter.highlights_level(*level)
-            }) {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            Span::styled(ch.to_string(), style)
-        })
-        .collect::<Vec<_>>();
-    Paragraph::new(Line::from(spans)).render(Rect::new(0, row, width as u16, 1), buffer);
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut current_style = None;
+    for (index, ch) in status.char_indices() {
+        let foreground = if filter_range.is_some_and(|(start, end)| index >= start && index < end) {
+            state.level_filter.status_color()
+        } else {
+            STATUS_BAR_FOREGROUND
+        };
+        let mut style = Style::default().fg(foreground).bg(STATUS_BAR_BACKGROUND);
+        if level_ranges.iter().any(|(start, end, level)| {
+            index >= *start && index < *end && state.level_filter.highlights_level(*level)
+        }) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if current_style.is_some_and(|current| current != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut current_text),
+                current_style.take().unwrap_or_default(),
+            ));
+        }
+        current_style = Some(style);
+        current_text.push(ch);
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            current_style.unwrap_or_default(),
+        ));
+    }
+    Paragraph::new(Line::from(spans))
+        .style(
+            Style::default()
+                .fg(STATUS_BAR_FOREGROUND)
+                .bg(STATUS_BAR_BACKGROUND),
+        )
+        .render(area, buffer);
 }
 
 fn token_level(token: &str) -> Option<Level> {
@@ -1871,7 +1766,6 @@ fn status_line(
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     input_finished: bool,
-    width: usize,
 ) -> String {
     let entry_count = entries.len();
     let selected = state.selected.map(|idx| idx + 1).unwrap_or(0);
@@ -1901,7 +1795,7 @@ fn status_line(
         if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
-    visible_slice(&format!("{status:<width$}"), 0, width)
+    status
 }
 
 fn search_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
@@ -1977,7 +1871,7 @@ fn hidden_percentage(hidden: usize, total: usize) -> usize {
     (hidden * 100 + total / 2) / total
 }
 
-fn level_color(level: Level) -> Color {
+const fn level_color(level: Level) -> Color {
     match level {
         Level::Trace => Color::DarkGray,
         Level::Debug => Color::LightCyan,
@@ -1988,15 +1882,11 @@ fn level_color(level: Level) -> Color {
     }
 }
 
-fn stream_color(stream: Stream) -> Color {
+const fn stream_color(stream: Stream) -> Color {
     match stream {
         Stream::Stdout => Color::DarkGray,
         Stream::Stderr => Color::LightYellow,
     }
-}
-
-fn string_color() -> Color {
-    Color::Rgb(206, 145, 120)
 }
 
 fn span_name_color(span: &str) -> Color {
@@ -2010,14 +1900,6 @@ fn span_palette_color(index: usize) -> Color {
     let (r, g, b) = hsl_to_rgb(hue, 0.34, 0.62);
 
     Color::Rgb(r, g, b)
-}
-
-fn span_key_color() -> Color {
-    Color::Rgb(156, 220, 254)
-}
-
-fn span_punctuation_color() -> Color {
-    Color::Rgb(150, 150, 150)
 }
 
 fn span_value_color(value: &str) -> Color {
@@ -2099,7 +1981,7 @@ fn scrollbar_slice_color(
         .unwrap_or(Color::DarkGray)
 }
 
-fn level_scrollbar_color(level: Level) -> Color {
+const fn level_scrollbar_color(level: Level) -> Color {
     match level {
         Level::Error => Color::LightRed,
         Level::Warn => Color::LightYellow,
@@ -2110,14 +1992,11 @@ fn level_scrollbar_color(level: Level) -> Color {
     }
 }
 
-fn visible_slice(input: &str, offset: usize, width: usize) -> String {
-    input.chars().skip(offset).take(width).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::TraceValueSection;
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn entries(count: usize) -> VecDeque<LogEntry> {
         (0..count)
@@ -2235,6 +2114,34 @@ mod tests {
                 search_query: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn ratatui_terminal_replaces_stale_log_cells_between_frames() {
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let entries = entries(1);
+        let state = ViewState::new();
+
+        terminal
+            .draw(|frame| draw(frame, &entries, &state, None, false))
+            .expect("draw populated frame");
+        assert!(
+            buffer_text(terminal.backend().buffer())
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("line 0"))
+        );
+
+        terminal
+            .draw(|frame| draw(frame, &VecDeque::new(), &state, None, false))
+            .expect("draw empty frame");
+        assert!(
+            buffer_text(terminal.backend().buffer())
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_end_matches('|').trim().is_empty())
+        );
     }
 
     #[test]
@@ -2385,7 +2292,7 @@ mod tests {
     fn compact_help_page_shows_raw_toggle() {
         let mut output = test_buffer(80, 6);
 
-        draw_help_page(&mut output, 80, 6);
+        draw_help_page(&mut output, Rect::new(0, 0, 80, 6));
         let text = buffer_text(&output);
 
         assert!(text.contains("r               toggle raw log line display"));
@@ -2395,7 +2302,7 @@ mod tests {
     fn help_page_shows_level_filter_shortcuts() {
         let mut output = test_buffer(80, 8);
 
-        draw_help_page(&mut output, 80, 8);
+        draw_help_page(&mut output, Rect::new(0, 0, 80, 8));
         let text = buffer_text(&output);
 
         assert!(text.contains("1..5            filter all, debug+, info+, warn+, error"));
@@ -2588,12 +2495,7 @@ mod tests {
             &mut output,
             Some(&entry),
             &ValuesPaneState::default(),
-            PaneViewport {
-                left: 0,
-                top: 0,
-                width: 40,
-                height: 6,
-            },
+            Rect::new(0, 0, 40, 6),
         );
         let text = buffer_text(&output);
 
@@ -2636,7 +2538,7 @@ mod tests {
         assert_eq!(state.selected, Some(1));
         assert_eq!(search_match_indices(&entries, &state), vec![1, 2]);
 
-        let status = status_line(&entries, &state, None, false, 120);
+        let status = status_line(&entries, &state, None, false);
         assert!(status.contains("search /er (2 results)"));
     }
 
@@ -2654,7 +2556,7 @@ mod tests {
         };
         let mut output = test_buffer(100, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 100);
+        draw_search_bar(&mut output, Rect::new(0, 0, 100, 1), &entries, &state);
         let text = buffer_text(&output);
 
         assert!(text.contains("Search(*): hit_"));
@@ -2677,8 +2579,8 @@ mod tests {
 
     #[test]
     fn status_bar_uses_high_contrast_neutral_tone() {
-        assert_eq!(status_bar_foreground(), Color::Black);
-        assert_eq!(status_bar_background(), Color::White);
+        assert_eq!(STATUS_BAR_FOREGROUND, Color::Black);
+        assert_eq!(STATUS_BAR_BACKGROUND, Color::White);
     }
 
     #[test]
@@ -2693,7 +2595,7 @@ mod tests {
         };
         let mut output = test_buffer(100, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 100);
+        draw_search_bar(&mut output, Rect::new(0, 0, 100, 1), &entries, &state);
         let text = buffer_text(&output);
 
         assert!(text.contains("Search: hit"));
@@ -2719,7 +2621,7 @@ mod tests {
             ..ViewState::new()
         };
         let mut first_output = test_buffer(120, 1);
-        draw_search_bar(&mut first_output, &entries, &first, 120);
+        draw_search_bar(&mut first_output, Rect::new(0, 0, 120, 1), &entries, &first);
         let first_text = buffer_text(&first_output);
         assert!(first_text.contains("2 results  1/2"));
         assert!(!first_text.contains("wrap"));
@@ -2730,7 +2632,7 @@ mod tests {
             ..ViewState::new()
         };
         let mut last_output = test_buffer(120, 1);
-        draw_search_bar(&mut last_output, &entries, &last, 120);
+        draw_search_bar(&mut last_output, Rect::new(0, 0, 120, 1), &entries, &last);
         let last_text = buffer_text(&last_output);
         assert!(last_text.contains("2 results  2/2"));
         assert!(!last_text.contains("wrap"));
@@ -2754,7 +2656,7 @@ mod tests {
         assert!(state.search_wrapped);
 
         let mut output = test_buffer(120, 1);
-        draw_search_bar(&mut output, &entries, &state, 120);
+        draw_search_bar(&mut output, Rect::new(0, 0, 120, 1), &entries, &state);
         let text = buffer_text(&output);
 
         assert!(text.contains("2 results  1/2  wrapped"));
@@ -2773,7 +2675,7 @@ mod tests {
         };
         let mut output = test_buffer(120, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 120);
+        draw_search_bar(&mut output, Rect::new(0, 0, 120, 1), &entries, &state);
         let text = buffer_text(&output);
 
         assert!(text.contains("1 result  1/1"));
@@ -2781,7 +2683,12 @@ mod tests {
 
         handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
         let mut wrapped_output = test_buffer(120, 1);
-        draw_search_bar(&mut wrapped_output, &entries, &state, 120);
+        draw_search_bar(
+            &mut wrapped_output,
+            Rect::new(0, 0, 120, 1),
+            &entries,
+            &state,
+        );
         let wrapped_text = buffer_text(&wrapped_output);
 
         assert!(wrapped_text.contains("1 result  1/1  wrapped"));
@@ -3064,7 +2971,7 @@ mod tests {
             ..ViewState::new()
         };
 
-        let status = status_line(&entries, &state, None, false, 120);
+        let status = status_line(&entries, &state, None, false);
 
         assert!(status.contains("focus alpha (2 hidden, 50%)"));
     }
@@ -3084,7 +2991,7 @@ mod tests {
             ..ViewState::new()
         };
 
-        let status = status_line(&entries, &state, None, false, 160);
+        let status = status_line(&entries, &state, None, false);
 
         assert!(status.contains("lvl ?1 T1 D1 I1 W1 E1"));
         assert!(status.contains("| WARN+ |"));
@@ -3103,7 +3010,14 @@ mod tests {
         };
         let mut output = test_buffer(160, 1);
 
-        draw_status_line(&mut output, &entries, &state, None, false, 160, 0);
+        draw_status_line(
+            &mut output,
+            Rect::new(0, 0, 160, 1),
+            &entries,
+            &state,
+            None,
+            false,
+        );
 
         assert!(token_is_bold(&output, "E1"));
         assert!(token_is_bold(&output, "W1"));
@@ -3120,7 +3034,14 @@ mod tests {
         let state = ViewState::new();
         let mut output = test_buffer(160, 1);
 
-        draw_status_line(&mut output, &entries, &state, None, false, 160, 0);
+        draw_status_line(
+            &mut output,
+            Rect::new(0, 0, 160, 1),
+            &entries,
+            &state,
+            None,
+            false,
+        );
 
         assert!(!token_is_bold(&output, "E1"));
         assert!(!token_is_bold(&output, "W1"));
@@ -3132,7 +3053,7 @@ mod tests {
         let entries = entries(1);
         let state = ViewState::new();
 
-        let status = status_line(&entries, &state, None, true, 120);
+        let status = status_line(&entries, &state, None, true);
 
         assert!(status.contains(" loaded |"));
     }
@@ -3314,38 +3235,62 @@ mod tests {
 
     #[test]
     fn line_viewport_marks_hidden_content_on_the_right() {
-        assert_eq!(
-            LineViewport::new(20, 0, 10),
-            LineViewport {
-                content_width: 9,
-                show_left_marker: false,
-                show_right_marker: true,
-            }
+        let mut buffer = test_buffer(10, 1);
+
+        render_entry_line(
+            &mut buffer,
+            Rect::new(0, 0, 10, 1),
+            Line::raw("abcdefghijklmnopqrst"),
+            0,
+            false,
         );
+
+        assert_eq!(buffer_text(&buffer), "abcdefghi>");
     }
 
     #[test]
     fn line_viewport_marks_hidden_content_on_both_sides() {
-        assert_eq!(
-            LineViewport::new(20, 5, 10),
-            LineViewport {
-                content_width: 8,
-                show_left_marker: true,
-                show_right_marker: true,
-            }
+        let mut buffer = test_buffer(10, 1);
+
+        render_entry_line(
+            &mut buffer,
+            Rect::new(0, 0, 10, 1),
+            Line::raw("abcdefghijklmnopqrst"),
+            5,
+            false,
         );
+
+        assert_eq!(buffer_text(&buffer), "<fghijklm>");
     }
 
     #[test]
     fn line_viewport_omits_markers_when_line_fits() {
-        assert_eq!(
-            LineViewport::new(8, 0, 10),
-            LineViewport {
-                content_width: 10,
-                show_left_marker: false,
-                show_right_marker: false,
-            }
+        let mut buffer = test_buffer(10, 1);
+
+        render_entry_line(
+            &mut buffer,
+            Rect::new(0, 0, 10, 1),
+            Line::raw("abcdefgh"),
+            0,
+            false,
         );
+
+        assert_eq!(buffer_text(&buffer), "abcdefgh  ");
+    }
+
+    #[test]
+    fn line_viewport_scrolls_wide_characters_by_display_width() {
+        let mut buffer = test_buffer(4, 1);
+
+        render_entry_line(
+            &mut buffer,
+            Rect::new(0, 0, 4, 1),
+            Line::raw("a界bc"),
+            1,
+            false,
+        );
+
+        assert_eq!(buffer_text(&buffer), "<界 >");
     }
 
     #[test]
@@ -3440,7 +3385,7 @@ mod tests {
         );
 
         assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
-        assert_eq!(parts[1], Part::new("\"user 42\"", string_color(), false));
+        assert_eq!(parts[1], Part::new("\"user 42\"", STRING_COLOR, false));
         assert_eq!(parts[2], Part::new(" from cache", Color::White, false));
     }
 
@@ -3457,7 +3402,7 @@ mod tests {
         assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
         assert_eq!(
             parts[1],
-            Part::new("\"user \\\"jonas\\\"\"", string_color(), false)
+            Part::new("\"user \\\"jonas\\\"\"", STRING_COLOR, false)
         );
     }
 
@@ -3502,14 +3447,14 @@ mod tests {
             parts[0],
             Part::new("request", span_name_color("request"), false)
         );
-        assert_eq!(parts[1], Part::new("{", span_punctuation_color(), false));
-        assert_eq!(parts[2], Part::new("id", span_key_color(), false));
-        assert_eq!(parts[3], Part::new("=", span_punctuation_color(), false));
+        assert_eq!(parts[1], Part::new("{", SPAN_PUNCTUATION_COLOR, false));
+        assert_eq!(parts[2], Part::new("id", SPAN_KEY_COLOR, false));
+        assert_eq!(parts[3], Part::new("=", SPAN_PUNCTUATION_COLOR, false));
         assert_eq!(parts[4], Part::new("7", span_value_color("7"), false));
         assert_eq!(parts[6], Part::new(": ", Color::DarkGray, false));
         assert_eq!(parts[7], Part::new("db", span_name_color("db"), false));
-        assert_eq!(parts[10], Part::new("=", span_punctuation_color(), false));
-        assert_eq!(parts[11], Part::new("\"select\"", string_color(), false));
+        assert_eq!(parts[10], Part::new("=", SPAN_PUNCTUATION_COLOR, false));
+        assert_eq!(parts[11], Part::new("\"select\"", STRING_COLOR, false));
     }
 
     #[test]

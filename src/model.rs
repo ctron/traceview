@@ -9,7 +9,7 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
-    pub(crate) fn indicator(self) -> char {
+    pub(crate) const fn indicator(self) -> char {
         match self {
             Self::Stdout => '|',
             Self::Stderr => '!',
@@ -28,7 +28,7 @@ pub(crate) enum Level {
 }
 
 impl Level {
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Trace => "TRACE",
             Self::Debug => "DEBUG",
@@ -39,7 +39,7 @@ impl Level {
         }
     }
 
-    pub(crate) fn severity(self) -> u8 {
+    pub(crate) const fn severity(self) -> u8 {
         match self {
             Self::Error => 5,
             Self::Warn => 4,
