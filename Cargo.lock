@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "traceviewer"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
