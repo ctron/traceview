@@ -1,16 +1,13 @@
-use std::{cmp, collections::VecDeque, io::Write, process::ExitStatus};
+use std::{cmp, collections::VecDeque, process::ExitStatus};
 
-use anyhow::Result;
-use crossterm::{
-    SynchronizedUpdate,
-    cursor::{Hide, MoveTo},
-    event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind},
-    queue,
-    style::{
-        Attribute, Color, Print, PrintStyledContent, ResetColor, SetAttribute, SetBackgroundColor,
-        SetForegroundColor, StyledContent, Stylize, style,
-    },
-    terminal::{self, Clear, ClearType},
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
 };
 
 use crate::model::{Level, LogEntry, MessagePart, Stream, TraceValue, TraceValueField};
@@ -503,50 +500,49 @@ fn handle_normal_key(
 }
 
 pub(crate) fn draw(
-    stdout: &mut impl Write,
+    frame: &mut Frame,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     input_finished: bool,
-) -> Result<()> {
-    let (cols, rows) = terminal::size()?;
-    stdout.sync_update(|stdout| {
-        draw_frame(
-            stdout,
-            entries,
-            state,
-            exit_status,
-            input_finished,
-            cols,
-            rows,
-        )
-    })??;
-    Ok(())
+) {
+    let area = frame.area();
+    draw_frame(
+        frame.buffer_mut(),
+        area,
+        entries,
+        state,
+        exit_status,
+        input_finished,
+    );
 }
 
 fn draw_frame(
-    stdout: &mut impl Write,
+    buffer: &mut Buffer,
+    area: Rect,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     input_finished: bool,
-    cols: u16,
-    rows: u16,
-) -> Result<()> {
+) {
+    let Rect {
+        width: cols,
+        height: rows,
+        ..
+    } = area;
     let content_rows = content_rows(rows, state);
     if state.help_visible {
-        queue!(stdout, Hide, Clear(ClearType::All))?;
-        draw_help_page(stdout, cols, content_rows)?;
+        draw_help_page(buffer, cols, content_rows);
         draw_status_line(
-            stdout,
+            buffer,
             entries,
             state,
             exit_status,
             input_finished,
             cols as usize,
             rows.saturating_sub(1),
-        )?;
-        return Ok(());
+        );
+        return;
     }
 
     let top_bar_rows = usize::from(search_bar_visible(state));
@@ -577,10 +573,8 @@ fn draw_frame(
         });
     let end_pos = cmp::min(start_pos + content_rows, visible.len());
 
-    queue!(stdout, Hide, Clear(ClearType::All))?;
-
     if search_bar_visible(state) {
-        draw_search_bar(stdout, entries, state, cols as usize)?;
+        draw_search_bar(buffer, entries, state, cols as usize);
     }
 
     if state.values.mode != ValuesPaneMode::Fullscreen {
@@ -588,20 +582,22 @@ fn draw_frame(
             let Some(entry) = entries.get(idx) else {
                 continue;
             };
-            queue!(stdout, MoveTo(0, (screen_row + top_bar_rows) as u16))?;
-            EntryRenderer::from(state).draw(
-                stdout,
+            let line = EntryRenderer::from(state).line(
                 entry,
                 state.x_offset,
                 log_width,
                 Some(idx) == selected,
-            )?;
+            );
+            Paragraph::new(line).render(
+                Rect::new(0, (screen_row + top_bar_rows) as u16, log_width as u16, 1),
+                buffer,
+            );
         }
     }
 
     if scrollbar_width > 0 && state.values.mode != ValuesPaneMode::Fullscreen {
         draw_scrollbar(
-            stdout,
+            buffer,
             entries,
             &visible,
             ScrollbarViewport {
@@ -614,7 +610,7 @@ fn draw_frame(
                     .saturating_sub(pane_width as u16)
                     .saturating_sub(pane_gap as u16),
             },
-        )?;
+        );
     }
 
     if pane_width > 0 {
@@ -625,7 +621,7 @@ fn draw_frame(
         };
         let selected_entry = selected.and_then(|idx| entries.get(idx));
         draw_values_pane(
-            stdout,
+            buffer,
             selected_entry,
             &state.values,
             PaneViewport {
@@ -634,19 +630,18 @@ fn draw_frame(
                 width: pane_width,
                 height: content_rows,
             },
-        )?;
+        );
     }
 
     draw_status_line(
-        stdout,
+        buffer,
         entries,
         state,
         exit_status,
         input_finished,
         cols as usize,
         rows.saturating_sub(1),
-    )?;
-    Ok(())
+    );
 }
 
 pub(crate) fn content_rows(rows: u16, state: &ViewState) -> usize {
@@ -658,11 +653,11 @@ fn search_bar_visible(state: &ViewState) -> bool {
 }
 
 fn draw_search_bar(
-    stdout: &mut impl Write,
+    buffer: &mut Buffer,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     width: usize,
-) -> Result<()> {
+) {
     let matches = search_match_indices(entries, state);
     let results = search_result_summary(&matches, state.selected, state.search_wrapped);
     let (prompt, cursor, help) = if state.search_editing {
@@ -675,27 +670,16 @@ fn draw_search_bar(
         state.search_query
     );
     let (foreground, background) = search_bar_colors(state.search_editing);
-    queue!(
-        stdout,
-        MoveTo(0, 0),
-        SetForegroundColor(foreground),
-        SetBackgroundColor(background),
-        Print(visible_slice(&format!("{bar:<width$}"), 0, width)),
-        ResetColor
-    )?;
-    Ok(())
+    Paragraph::new(Span::styled(
+        visible_slice(&format!("{bar:<width$}"), 0, width),
+        Style::default().fg(foreground).bg(background),
+    ))
+    .render(Rect::new(0, 0, width as u16, 1), buffer);
 }
 
 fn search_bar_colors(editing: bool) -> (Color, Color) {
     if editing {
-        (
-            Color::Black,
-            Color::Rgb {
-                r: 150,
-                g: 205,
-                b: 255,
-            },
-        )
+        (Color::Black, Color::Rgb(150, 205, 255))
     } else {
         (Color::Black, Color::White)
     }
@@ -745,32 +729,28 @@ struct ScrollbarViewport {
 }
 
 fn draw_scrollbar(
-    stdout: &mut impl Write,
+    buffer: &mut Buffer,
     entries: &VecDeque<LogEntry>,
     visible_indices: &[usize],
     viewport: ScrollbarViewport,
-) -> Result<()> {
+) {
     for row in 0..viewport.height {
         let slice = ScrollbarSlice::new(row, viewport.height, visible_indices.len());
         let in_view = slice.start < viewport.visible_end && slice.end > viewport.visible_start;
         let color = scrollbar_slice_color(entries, visible_indices, slice.start, slice.end);
-        let marker = if in_view { "#" } else { "|" };
-        let mut styled = style(marker).with(color);
+        let marker = if in_view { '#' } else { '|' };
+        let mut style = Style::default().fg(color);
         if in_view {
-            styled = styled.attribute(Attribute::Bold);
+            style = style.add_modifier(Modifier::BOLD);
         }
 
-        queue!(
-            stdout,
-            MoveTo(viewport.column, (row + viewport.top_row) as u16),
-            PrintStyledContent(styled)
-        )?;
+        if let Some(cell) = buffer.cell_mut((viewport.column, (row + viewport.top_row) as u16)) {
+            cell.set_char(marker).set_style(style);
+        }
     }
-
-    Ok(())
 }
 
-fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Result<()> {
+fn draw_help_page(buffer: &mut Buffer, cols: u16, content_rows: usize) {
     let lines = [
         "tv help",
         "",
@@ -797,19 +777,18 @@ fn draw_help_page(stdout: &mut impl Write, cols: u16, content_rows: usize) -> Re
         "  Mouse wheel     move cursor vertically",
     ];
 
-    for (row, line) in lines.iter().take(content_rows).enumerate() {
+    let lines = lines.iter().take(content_rows).map(|line| {
         let color = match *line {
-            "tv help" | "Navigation" | "Actions" => Color::Cyan,
+            "tv help" | "Navigation" | "Actions" => Color::LightCyan,
             _ => Color::White,
         };
-        queue!(
-            stdout,
-            MoveTo(0, row as u16),
-            PrintStyledContent(visible_slice(line, 0, cols as usize).with(color))
-        )?;
-    }
-
-    Ok(())
+        Line::styled(
+            visible_slice(line, 0, cols as usize),
+            Style::default().fg(color),
+        )
+    });
+    Paragraph::new(lines.collect::<Vec<_>>())
+        .render(Rect::new(0, 0, cols, content_rows as u16), buffer);
 }
 
 pub(crate) fn selected_line_text(
@@ -850,51 +829,48 @@ fn values_pane_width(cols: usize, state: &ValuesPaneState) -> usize {
 }
 
 fn draw_values_pane(
-    stdout: &mut impl Write,
+    buffer: &mut Buffer,
     entry: Option<&LogEntry>,
     state: &ValuesPaneState,
     viewport: PaneViewport,
-) -> Result<()> {
+) {
     if viewport.width == 0 || viewport.height == 0 {
-        return Ok(());
+        return;
     }
 
     for row in 0..viewport.height {
         let text_width = viewport.width.saturating_sub(1);
-        queue!(
-            stdout,
-            MoveTo(viewport.left as u16, (viewport.top + row) as u16),
-            PrintStyledContent("|".with(Color::DarkGrey))
-        )?;
-
-        match row {
-            0 => print_padded_segment(
-                stdout,
+        let content = match row {
+            0 => Line::from(padded_span(
                 "Tracing values",
                 0,
                 text_width,
-                Color::Cyan,
+                Color::LightCyan,
                 false,
                 true,
-            )?,
+            )),
             row => match entry.and_then(|entry| values_pane_row(entry, row - 1)) {
-                Some(ValuesPaneRow::Section(title)) => {
-                    print_padded_segment(stdout, title, 0, text_width, Color::Cyan, false, true)?;
-                }
+                Some(ValuesPaneRow::Section(title)) => Line::from(padded_span(
+                    title,
+                    0,
+                    text_width,
+                    Color::LightCyan,
+                    false,
+                    true,
+                )),
                 Some(ValuesPaneRow::Field { index, field }) => {
                     let selected = state.selected == Some(index);
-                    print_value_row(
-                        stdout,
+                    value_row(
                         &field.key,
                         &field.value.render_text(),
                         trace_value_color(&field.value),
                         state.x_offset,
                         text_width,
                         selected,
-                    )?;
+                    )
                 }
                 Some(ValuesPaneRow::Spacer) => {
-                    print_padded_segment(stdout, "", 0, text_width, Color::White, false, false)?;
+                    Line::from(padded_span("", 0, text_width, Color::White, false, false))
                 }
                 None => {
                     let empty_label =
@@ -903,22 +879,30 @@ fn draw_values_pane(
                         } else {
                             ""
                         };
-                    print_padded_segment(
-                        stdout,
+                    Line::from(padded_span(
                         empty_label,
                         0,
                         text_width,
                         Color::White,
                         false,
                         false,
-                    )?;
+                    ))
                 }
             },
-        }
-        queue!(stdout, ResetColor)?;
+        };
+        let mut spans = vec![Span::styled("|", Style::default().fg(Color::DarkGray))];
+        spans.extend(content.spans);
+        let line = Line::from(spans);
+        Paragraph::new(line).render(
+            Rect::new(
+                viewport.left as u16,
+                (viewport.top + row) as u16,
+                viewport.width as u16,
+                1,
+            ),
+            buffer,
+        );
     }
-
-    Ok(())
 }
 
 enum ValuesPaneRow<'a> {
@@ -983,81 +967,75 @@ fn value_field_count(entry: &LogEntry) -> usize {
         .sum()
 }
 
-fn print_value_row(
-    stdout: &mut impl Write,
+fn value_row(
     key: &str,
     value: &str,
     value_color: Color,
     x_offset: usize,
     width: usize,
     selected: bool,
-) -> Result<()> {
+) -> Line<'static> {
     let prefix = format!("{key} = ");
     let prefix_width = prefix.chars().count();
+    let mut spans = Vec::new();
 
     if x_offset < prefix_width {
         let prefix_width = cmp::min(prefix_width - x_offset, width);
-        print_padded_segment(
-            stdout,
+        spans.push(padded_span(
             &prefix,
             x_offset,
             prefix_width,
             Color::White,
             selected,
             false,
-        )?;
-        print_padded_segment(
-            stdout,
+        ));
+        spans.push(padded_span(
             value,
             0,
             width.saturating_sub(prefix_width),
             value_color,
             selected,
             false,
-        )?;
+        ));
     } else {
-        print_padded_segment(
-            stdout,
+        spans.push(padded_span(
             value,
             x_offset - prefix_width,
             width,
             value_color,
             selected,
             false,
-        )?;
+        ));
     }
 
-    Ok(())
+    Line::from(spans)
 }
 
-fn print_padded_segment(
-    stdout: &mut impl Write,
+fn padded_span(
     text: &str,
     x_offset: usize,
     width: usize,
     color: Color,
     selected: bool,
     bold: bool,
-) -> Result<()> {
+) -> Span<'static> {
     let text = visible_slice(text, x_offset, width);
     let background = if selected {
         selected_background()
     } else {
         Color::Reset
     };
-    queue!(
-        stdout,
-        SetBackgroundColor(background),
-        PrintStyledContent(apply_style(format!("{text:<width$}"), color, bold))
-    )?;
-    Ok(())
+    Span::styled(
+        format!("{text:<width$}"),
+        apply_style(color, bold).bg(background),
+    )
 }
 
 fn trace_value_color(value: &TraceValue) -> Color {
     match value {
         TraceValue::Bool(_) | TraceValue::Number(_) => Color::Reset,
-        TraceValue::String(_) => Color::Green,
-        TraceValue::Null => Color::DarkGrey,
+        TraceValue::String(_) => Color::LightGreen,
+        TraceValue::Null => Color::DarkGray,
         TraceValue::Object(_) | TraceValue::Array(_) => Color::Reset,
         TraceValue::Other(_) => Color::White,
     }
@@ -1323,35 +1301,34 @@ impl EntryRenderer {
         }
     }
 
-    fn draw(
+    fn line(
         self,
-        stdout: &mut impl Write,
         entry: &LogEntry,
         x_offset: usize,
         width: usize,
         selected: bool,
-    ) -> Result<()> {
+    ) -> Line<'static> {
         let parts = self.parts(entry);
         let rendered = Self::plain_text_from_parts(&parts);
         let rendered_width = rendered.chars().count();
         if width == 0 {
-            return Ok(());
+            return Line::default();
         }
 
         let viewport = LineViewport::new(rendered_width, x_offset, width);
         let content_width = viewport.content_width;
         let visible = visible_slice(&rendered, x_offset, content_width);
         let mut cursor = 0usize;
+        let mut spans = Vec::new();
 
         if viewport.show_left_marker {
-            print_segment(
-                stdout,
+            spans.push(styled_span(
                 "<".to_string(),
-                Color::DarkGrey,
+                Color::DarkGray,
                 true,
                 false,
                 selected,
-            )?;
+            ));
         }
 
         for part in parts {
@@ -1373,43 +1350,37 @@ impl EntryRenderer {
                 .skip(local_start)
                 .take(local_len)
                 .collect();
-            print_segment(
-                stdout,
+            spans.push(styled_span(
                 segment,
                 part.color,
                 part.bold,
                 part.highlighted,
                 selected,
-            )?;
+            ));
         }
 
         let remaining = content_width.saturating_sub(visible.chars().count());
         if remaining > 0 {
-            print_segment(
-                stdout,
+            spans.push(styled_span(
                 " ".repeat(remaining),
                 Color::White,
                 false,
                 false,
                 selected,
-            )?;
+            ));
         }
 
         if viewport.show_right_marker {
-            print_segment(
-                stdout,
+            spans.push(styled_span(
                 ">".to_string(),
-                Color::DarkGrey,
+                Color::DarkGray,
                 true,
                 false,
                 selected,
-            )?;
+            ));
         }
 
-        if selected {
-            queue!(stdout, ResetColor)?;
-        }
-        Ok(())
+        Line::from(spans)
     }
 
     fn plain_text(&self, entry: &LogEntry) -> String {
@@ -1432,7 +1403,7 @@ impl EntryRenderer {
             return apply_search_highlights(parts, self.search_highlight_query(entry));
         }
         if let Some(timestamp) = &entry.timestamp {
-            parts.push(Part::new(format!("{timestamp} "), Color::DarkGrey, false));
+            parts.push(Part::new(format!("{timestamp} "), Color::DarkGray, false));
         }
         if entry.parsed {
             parts.push(Part::new(
@@ -1475,19 +1446,19 @@ impl EntryRenderer {
         while let Some(module) = modules.next() {
             parts.push(Part::new(module, target_module_color(module), false));
             if modules.peek().is_some() {
-                parts.push(Part::new("::", Color::DarkGrey, false));
+                parts.push(Part::new("::", Color::DarkGray, false));
             }
         }
         if !suffix.is_empty() {
-            parts.push(Part::new(suffix, Color::DarkGrey, false));
+            parts.push(Part::new(suffix, Color::DarkGray, false));
         }
-        parts.push(Part::new(": ", Color::DarkGrey, false));
+        parts.push(Part::new(": ", Color::DarkGray, false));
     }
 
     fn push_span_parts(&self, parts: &mut Vec<Part>, spans: &[String]) {
         for span in spans {
             self.push_span_part(parts, span);
-            parts.push(Part::new(": ", Color::DarkGrey, false));
+            parts.push(Part::new(": ", Color::DarkGray, false));
         }
     }
 
@@ -1658,11 +1629,11 @@ impl EntryRenderer {
             MessagePart::Fields(fields) => {
                 parts.push(Part::new(
                     if after_text { " (" } else { "(" },
-                    Color::DarkGrey,
+                    Color::DarkGray,
                     false,
                 ));
                 self.push_trace_fields(parts, fields, " ");
-                parts.push(Part::new(")", Color::DarkGrey, false));
+                parts.push(Part::new(")", Color::DarkGray, false));
             }
         }
     }
@@ -1675,10 +1646,10 @@ impl EntryRenderer {
     ) {
         for (idx, field) in fields.iter().enumerate() {
             if idx > 0 {
-                parts.push(Part::new(separator, Color::DarkGrey, false));
+                parts.push(Part::new(separator, Color::DarkGray, false));
             }
-            parts.push(Part::new(&field.key, Color::Blue, true));
-            parts.push(Part::new("=", Color::DarkGrey, false));
+            parts.push(Part::new(&field.key, Color::LightBlue, true));
+            parts.push(Part::new("=", Color::DarkGray, false));
             self.push_trace_value(parts, &field.value);
         }
     }
@@ -1688,11 +1659,11 @@ impl EntryRenderer {
             TraceValue::Bool(value) => {
                 parts.push(Part::new(value.to_string(), Color::Reset, false))
             }
-            TraceValue::Null => parts.push(Part::new("null", Color::DarkGrey, false)),
+            TraceValue::Null => parts.push(Part::new("null", Color::DarkGray, false)),
             TraceValue::Number(value) => parts.push(Part::new(value, Color::Reset, false)),
             TraceValue::String(value) => parts.push(Part::new(
                 serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
-                Color::Green,
+                Color::LightGreen,
                 false,
             )),
             TraceValue::Other(value) => parts.push(Part::new(value, Color::White, false)),
@@ -1700,7 +1671,7 @@ impl EntryRenderer {
                 parts.push(Part::new("[", Color::Reset, true));
                 for (idx, value) in values.iter().enumerate() {
                     if idx > 0 {
-                        parts.push(Part::new(",", Color::DarkGrey, false));
+                        parts.push(Part::new(",", Color::DarkGray, false));
                     }
                     self.push_trace_value(parts, value);
                 }
@@ -1710,14 +1681,14 @@ impl EntryRenderer {
                 parts.push(Part::new("{", Color::Reset, true));
                 for (idx, (key, value)) in fields.iter().enumerate() {
                     if idx > 0 {
-                        parts.push(Part::new(",", Color::DarkGrey, false));
+                        parts.push(Part::new(",", Color::DarkGray, false));
                     }
                     parts.push(Part::new(
                         serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
-                        Color::Blue,
+                        Color::LightBlue,
                         true,
                     ));
-                    parts.push(Part::new(":", Color::DarkGrey, false));
+                    parts.push(Part::new(":", Color::DarkGray, false));
                     self.push_trace_value(parts, value);
                 }
                 parts.push(Part::new("}", Color::Reset, true));
@@ -1771,65 +1742,47 @@ impl ScrollbarSlice {
     }
 }
 
-fn print_segment(
-    stdout: &mut impl Write,
+fn styled_span(
     text: String,
     color: Color,
     bold: bool,
     highlighted: bool,
     selected: bool,
-) -> Result<()> {
-    if highlighted {
-        queue!(
-            stdout,
-            SetBackgroundColor(search_match_background()),
-            SetForegroundColor(search_match_foreground())
-        )?;
-        if bold {
-            queue!(stdout, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(stdout, Print(text), ResetColor)?;
-        if bold {
-            queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
-        }
+) -> Span<'static> {
+    let style = if highlighted {
+        Style::default()
+            .bg(search_match_background())
+            .fg(search_match_foreground())
     } else if selected {
-        queue!(
-            stdout,
-            SetBackgroundColor(selected_background()),
-            SetForegroundColor(selected_foreground(color))
-        )?;
-        if bold {
-            queue!(stdout, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(stdout, Print(text))?;
-        if bold {
-            queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
-        }
+        Style::default()
+            .bg(selected_background())
+            .fg(selected_foreground(color))
     } else {
-        queue!(stdout, PrintStyledContent(apply_style(text, color, bold)))?;
-    }
+        Style::default().fg(color)
+    };
+    let style = if bold {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    };
 
-    Ok(())
+    Span::styled(text, style)
 }
 
-fn apply_style(text: String, color: Color, bold: bool) -> StyledContent<String> {
-    let mut styled = style(text).with(color);
+fn apply_style(color: Color, bold: bool) -> Style {
+    let mut style = Style::default().fg(color);
     if bold {
-        styled = styled.attribute(Attribute::Bold);
+        style = style.add_modifier(Modifier::BOLD);
     }
-    styled
+    style
 }
 
 fn selected_background() -> Color {
-    Color::Rgb {
-        r: 64,
-        g: 64,
-        b: 64,
-    }
+    Color::Rgb(64, 64, 64)
 }
 
 fn search_match_background() -> Color {
-    Color::Yellow
+    Color::LightYellow
 }
 
 fn search_match_foreground() -> Color {
@@ -1838,98 +1791,67 @@ fn search_match_foreground() -> Color {
 
 fn selected_foreground(color: Color) -> Color {
     match color {
-        Color::Red => Color::DarkRed,
-        Color::Yellow => Color::DarkYellow,
-        Color::Green => Color::DarkGreen,
-        Color::Blue => Color::DarkBlue,
-        Color::Cyan => Color::DarkCyan,
-        Color::White | Color::Grey => Color::Reset,
+        Color::LightRed => Color::Red,
+        Color::LightYellow => Color::Yellow,
+        Color::LightGreen => Color::Green,
+        Color::LightBlue => Color::Blue,
+        Color::LightCyan => Color::Cyan,
+        Color::White | Color::Gray => Color::Reset,
         other => other,
     }
 }
 
 fn draw_status_line(
-    stdout: &mut impl Write,
+    buffer: &mut Buffer,
     entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     input_finished: bool,
     width: usize,
     row: u16,
-) -> Result<()> {
+) {
     let status = status_line(entries, state, exit_status, input_finished, width);
     let filter = state.level_filter.status_label();
-
-    queue!(
-        stdout,
-        MoveTo(0, row),
-        SetForegroundColor(status_bar_foreground()),
-        SetBackgroundColor(status_bar_background()),
-    )?;
-
-    if let Some(start) = status.find(filter) {
-        draw_status_with_highlights(stdout, &status[..start], state)?;
-        queue!(
-            stdout,
-            SetForegroundColor(state.level_filter.status_color())
-        )?;
-        draw_status_with_highlights(stdout, &status[start..start + filter.len()], state)?;
-        queue!(stdout, SetForegroundColor(status_bar_foreground()))?;
-        draw_status_with_highlights(stdout, &status[start + filter.len()..], state)?;
-        queue!(stdout, ResetColor)?;
-    } else {
-        draw_status_with_highlights(stdout, &status, state)?;
-        queue!(stdout, ResetColor)?;
-    }
-
-    Ok(())
-}
-
-fn draw_status_with_highlights(
-    stdout: &mut impl Write,
-    status: &str,
-    state: &ViewState,
-) -> Result<()> {
-    let Some(levels_start) = status.find("lvl ").map(|start| start + "lvl ".len()) else {
-        queue!(stdout, Print(status))?;
-        return Ok(());
-    };
-    let Some(levels_len) = status[levels_start..].find(" | ") else {
-        queue!(stdout, Print(status))?;
-        return Ok(());
-    };
-
-    let levels_end = levels_start + levels_len;
-    queue!(stdout, Print(&status[..levels_start]))?;
-    draw_level_status(
-        stdout,
-        &status[levels_start..levels_end],
-        state.level_filter,
-    )?;
-    queue!(stdout, Print(&status[levels_end..]))?;
-    Ok(())
-}
-
-fn draw_level_status(stdout: &mut impl Write, levels: &str, filter: LevelFilter) -> Result<()> {
-    for (idx, token) in levels.split(' ').enumerate() {
-        if idx > 0 {
-            queue!(stdout, Print(" "))?;
-        }
-
-        if let Some(level) = token_level(token)
-            && filter.highlights_level(level)
-        {
-            queue!(
-                stdout,
-                SetAttribute(Attribute::Bold),
-                Print(token),
-                SetAttribute(Attribute::NormalIntensity)
-            )?;
-        } else {
-            queue!(stdout, Print(token))?;
-        }
-    }
-    Ok(())
+    let filter_range = status
+        .find(filter)
+        .map(|start| (start, start.saturating_add(filter.len())));
+    let level_ranges = status
+        .find("lvl ")
+        .map(|start| start + "lvl ".len())
+        .and_then(|start| status[start..].find(" | ").map(|len| (start, start + len)))
+        .map(|(start, end)| {
+            let mut offset = start;
+            status[start..end]
+                .split_inclusive(' ')
+                .filter_map(|token| {
+                    let trimmed = token.trim_end();
+                    let token_start = offset;
+                    offset += token.len();
+                    token_level(trimmed)
+                        .map(|level| (token_start, token_start + trimmed.len(), level))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let spans = status
+        .char_indices()
+        .map(|(index, ch)| {
+            let foreground =
+                if filter_range.is_some_and(|(start, end)| index >= start && index < end) {
+                    state.level_filter.status_color()
+                } else {
+                    status_bar_foreground()
+                };
+            let mut style = Style::default().fg(foreground).bg(status_bar_background());
+            if level_ranges.iter().any(|(start, end, level)| {
+                index >= *start && index < *end && state.level_filter.highlights_level(*level)
+            }) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            Span::styled(ch.to_string(), style)
+        })
+        .collect::<Vec<_>>();
+    Paragraph::new(Line::from(spans)).render(Rect::new(0, row, width as u16, 1), buffer);
 }
 
 fn token_level(token: &str) -> Option<Level> {
@@ -2057,28 +1979,24 @@ fn hidden_percentage(hidden: usize, total: usize) -> usize {
 
 fn level_color(level: Level) -> Color {
     match level {
-        Level::Trace => Color::DarkGrey,
-        Level::Debug => Color::Cyan,
-        Level::Info => Color::Green,
-        Level::Warn => Color::Yellow,
-        Level::Error => Color::Red,
+        Level::Trace => Color::DarkGray,
+        Level::Debug => Color::LightCyan,
+        Level::Info => Color::LightGreen,
+        Level::Warn => Color::LightYellow,
+        Level::Error => Color::LightRed,
         Level::Unknown => Color::White,
     }
 }
 
 fn stream_color(stream: Stream) -> Color {
     match stream {
-        Stream::Stdout => Color::DarkGrey,
-        Stream::Stderr => Color::Yellow,
+        Stream::Stdout => Color::DarkGray,
+        Stream::Stderr => Color::LightYellow,
     }
 }
 
 fn string_color() -> Color {
-    Color::Rgb {
-        r: 206,
-        g: 145,
-        b: 120,
-    }
+    Color::Rgb(206, 145, 120)
 }
 
 fn span_name_color(span: &str) -> Color {
@@ -2091,38 +2009,22 @@ fn span_palette_color(index: usize) -> Color {
     let hue = (index as f32 * 360.0 / SPAN_PALETTE_SIZE as f32 + 18.0) % 360.0;
     let (r, g, b) = hsl_to_rgb(hue, 0.34, 0.62);
 
-    Color::Rgb { r, g, b }
+    Color::Rgb(r, g, b)
 }
 
 fn span_key_color() -> Color {
-    Color::Rgb {
-        r: 156,
-        g: 220,
-        b: 254,
-    }
+    Color::Rgb(156, 220, 254)
 }
 
 fn span_punctuation_color() -> Color {
-    Color::Rgb {
-        r: 150,
-        g: 150,
-        b: 150,
-    }
+    Color::Rgb(150, 150, 150)
 }
 
 fn span_value_color(value: &str) -> Color {
     if matches!(value, "true" | "false") {
-        Color::Rgb {
-            r: 86,
-            g: 156,
-            b: 214,
-        }
+        Color::Rgb(86, 156, 214)
     } else if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        Color::Rgb {
-            r: 181,
-            g: 206,
-            b: 168,
-        }
+        Color::Rgb(181, 206, 168)
     } else {
         Color::Reset
     }
@@ -2140,7 +2042,7 @@ fn target_palette_color(index: usize) -> Color {
     let lightness = 0.58 + ((index / 16) % 2) as f32 * 0.10;
     let (r, g, b) = hsl_to_rgb(hue, saturation.min(0.78), lightness.min(0.72));
 
-    Color::Rgb { r, g, b }
+    Color::Rgb(r, g, b)
 }
 
 fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
@@ -2173,9 +2075,9 @@ fn stable_hash(value: &str) -> usize {
 
 fn message_color(entry: &LogEntry) -> Color {
     match (entry.level, entry.stream) {
-        (Level::Error, _) => Color::Red,
-        (Level::Warn, _) => Color::Yellow,
-        (Level::Unknown, Stream::Stderr) => Color::Yellow,
+        (Level::Error, _) => Color::LightRed,
+        (Level::Warn, _) => Color::LightYellow,
+        (Level::Unknown, Stream::Stderr) => Color::LightYellow,
         _ => Color::White,
     }
 }
@@ -2194,17 +2096,17 @@ fn scrollbar_slice_color(
         .map(|entry| entry.level)
         .max_by_key(|level| level.severity())
         .map(level_scrollbar_color)
-        .unwrap_or(Color::DarkGrey)
+        .unwrap_or(Color::DarkGray)
 }
 
 fn level_scrollbar_color(level: Level) -> Color {
     match level {
-        Level::Error => Color::Red,
-        Level::Warn => Color::Yellow,
-        Level::Info => Color::Green,
-        Level::Debug => Color::Cyan,
-        Level::Trace => Color::DarkGrey,
-        Level::Unknown => Color::DarkGrey,
+        Level::Error => Color::LightRed,
+        Level::Warn => Color::LightYellow,
+        Level::Info => Color::LightGreen,
+        Level::Debug => Color::LightCyan,
+        Level::Trace => Color::DarkGray,
+        Level::Unknown => Color::DarkGray,
     }
 }
 
@@ -2294,6 +2196,35 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn test_buffer(width: u16, height: u16) -> Buffer {
+        Buffer::empty(Rect::new(0, 0, width, height))
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|row| {
+                (area.left()..area.right())
+                    .filter_map(|column| buffer.cell((column, row)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn token_is_bold(buffer: &Buffer, token: &str) -> bool {
+        let text = buffer_text(buffer);
+        let Some(start) = text.find(token) else {
+            return false;
+        };
+        (start..start + token.len()).all(|column| {
+            buffer
+                .cell((column as u16, 0))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::BOLD))
+        })
     }
 
     fn renderer() -> EntryRenderer {
@@ -2452,20 +2383,20 @@ mod tests {
 
     #[test]
     fn compact_help_page_shows_raw_toggle() {
-        let mut output = Vec::new();
+        let mut output = test_buffer(80, 6);
 
-        draw_help_page(&mut output, 80, 6).expect("draw help");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_help_page(&mut output, 80, 6);
+        let text = buffer_text(&output);
 
         assert!(text.contains("r               toggle raw log line display"));
     }
 
     #[test]
     fn help_page_shows_level_filter_shortcuts() {
-        let mut output = Vec::new();
+        let mut output = test_buffer(80, 8);
 
-        draw_help_page(&mut output, 80, 8).expect("draw help");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_help_page(&mut output, 80, 8);
+        let text = buffer_text(&output);
 
         assert!(text.contains("1..5            filter all, debug+, info+, warn+, error"));
     }
@@ -2651,7 +2582,7 @@ mod tests {
                 )],
             ),
         ]);
-        let mut output = Vec::new();
+        let mut output = test_buffer(40, 6);
 
         draw_values_pane(
             &mut output,
@@ -2663,9 +2594,8 @@ mod tests {
                 width: 40,
                 height: 6,
             },
-        )
-        .expect("draw pane");
-        let text = String::from_utf8(output).expect("utf8");
+        );
+        let text = buffer_text(&output);
 
         assert!(text.contains("Tracing values"));
         assert!(text.contains("scope: request"));
@@ -2722,10 +2652,10 @@ mod tests {
             search_query: "hit".to_string(),
             ..ViewState::new()
         };
-        let mut output = Vec::new();
+        let mut output = test_buffer(100, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 100).expect("draw search bar");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_search_bar(&mut output, &entries, &state, 100);
+        let text = buffer_text(&output);
 
         assert!(text.contains("Search(*): hit_"));
         assert!(text.contains("2 results"));
@@ -2740,14 +2670,7 @@ mod tests {
     fn search_bar_colors_distinguish_editing_from_locked() {
         assert_eq!(
             search_bar_colors(true),
-            (
-                Color::Black,
-                Color::Rgb {
-                    r: 150,
-                    g: 205,
-                    b: 255
-                }
-            )
+            (Color::Black, Color::Rgb(150, 205, 255))
         );
         assert_eq!(search_bar_colors(false), (Color::Black, Color::White));
     }
@@ -2768,10 +2691,10 @@ mod tests {
             search_query: "hit".to_string(),
             ..ViewState::new()
         };
-        let mut output = Vec::new();
+        let mut output = test_buffer(100, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 100).expect("draw search bar");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_search_bar(&mut output, &entries, &state, 100);
+        let text = buffer_text(&output);
 
         assert!(text.contains("Search: hit"));
         assert!(text.contains("/ edit"));
@@ -2795,9 +2718,9 @@ mod tests {
             search_query: "hit".to_string(),
             ..ViewState::new()
         };
-        let mut first_output = Vec::new();
-        draw_search_bar(&mut first_output, &entries, &first, 120).expect("draw search bar");
-        let first_text = String::from_utf8(first_output).expect("utf8");
+        let mut first_output = test_buffer(120, 1);
+        draw_search_bar(&mut first_output, &entries, &first, 120);
+        let first_text = buffer_text(&first_output);
         assert!(first_text.contains("2 results  1/2"));
         assert!(!first_text.contains("wrap"));
 
@@ -2806,9 +2729,9 @@ mod tests {
             search_query: "hit".to_string(),
             ..ViewState::new()
         };
-        let mut last_output = Vec::new();
-        draw_search_bar(&mut last_output, &entries, &last, 120).expect("draw search bar");
-        let last_text = String::from_utf8(last_output).expect("utf8");
+        let mut last_output = test_buffer(120, 1);
+        draw_search_bar(&mut last_output, &entries, &last, 120);
+        let last_text = buffer_text(&last_output);
         assert!(last_text.contains("2 results  2/2"));
         assert!(!last_text.contains("wrap"));
     }
@@ -2830,9 +2753,9 @@ mod tests {
         assert_eq!(state.selected, Some(0));
         assert!(state.search_wrapped);
 
-        let mut output = Vec::new();
-        draw_search_bar(&mut output, &entries, &state, 120).expect("draw search bar");
-        let text = String::from_utf8(output).expect("utf8");
+        let mut output = test_buffer(120, 1);
+        draw_search_bar(&mut output, &entries, &state, 120);
+        let text = buffer_text(&output);
 
         assert!(text.contains("2 results  1/2  wrapped"));
     }
@@ -2848,18 +2771,18 @@ mod tests {
             search_query: "hit".to_string(),
             ..ViewState::new()
         };
-        let mut output = Vec::new();
+        let mut output = test_buffer(120, 1);
 
-        draw_search_bar(&mut output, &entries, &state, 120).expect("draw search bar");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_search_bar(&mut output, &entries, &state, 120);
+        let text = buffer_text(&output);
 
         assert!(text.contains("1 result  1/1"));
         assert!(!text.contains("wrapped"));
 
         handle_key(key(KeyCode::Char('n')), &entries, &mut state, false, 5);
-        let mut wrapped_output = Vec::new();
-        draw_search_bar(&mut wrapped_output, &entries, &state, 120).expect("draw search bar");
-        let wrapped_text = String::from_utf8(wrapped_output).expect("utf8");
+        let mut wrapped_output = test_buffer(120, 1);
+        draw_search_bar(&mut wrapped_output, &entries, &state, 120);
+        let wrapped_text = buffer_text(&wrapped_output);
 
         assert!(wrapped_text.contains("1 result  1/1  wrapped"));
     }
@@ -3178,14 +3101,13 @@ mod tests {
             level_filter: LevelFilter::AtLeast(Level::Warn),
             ..ViewState::new()
         };
-        let mut output = Vec::new();
+        let mut output = test_buffer(160, 1);
 
-        draw_status_line(&mut output, &entries, &state, None, false, 160, 0).expect("draw status");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_status_line(&mut output, &entries, &state, None, false, 160, 0);
 
-        assert!(text.contains("\x1b[1mE1\x1b[22m"));
-        assert!(text.contains("\x1b[1mW1\x1b[22m"));
-        assert!(!text.contains("\x1b[1mI1\x1b[22m"));
+        assert!(token_is_bold(&output, "E1"));
+        assert!(token_is_bold(&output, "W1"));
+        assert!(!token_is_bold(&output, "I1"));
     }
 
     #[test]
@@ -3196,14 +3118,13 @@ mod tests {
             entry_with_level(Level::Info),
         ]);
         let state = ViewState::new();
-        let mut output = Vec::new();
+        let mut output = test_buffer(160, 1);
 
-        draw_status_line(&mut output, &entries, &state, None, false, 160, 0).expect("draw status");
-        let text = String::from_utf8(output).expect("utf8");
+        draw_status_line(&mut output, &entries, &state, None, false, 160, 0);
 
-        assert!(!text.contains("\x1b[1mE1\x1b[22m"));
-        assert!(!text.contains("\x1b[1mW1\x1b[22m"));
-        assert!(!text.contains("\x1b[1mI1\x1b[22m"));
+        assert!(!token_is_bold(&output, "E1"));
+        assert!(!token_is_bold(&output, "W1"));
+        assert!(!token_is_bold(&output, "I1"));
     }
 
     #[test]
@@ -3456,13 +3377,16 @@ mod tests {
 
         assert_eq!(
             scrollbar_slice_color(&entries, &visible, 0, 2),
-            Color::Green
+            Color::LightGreen
         );
         assert_eq!(
             scrollbar_slice_color(&entries, &visible, 0, 3),
-            Color::Yellow
+            Color::LightYellow
         );
-        assert_eq!(scrollbar_slice_color(&entries, &visible, 0, 4), Color::Red);
+        assert_eq!(
+            scrollbar_slice_color(&entries, &visible, 0, 4),
+            Color::LightRed
+        );
     }
 
     #[test]
@@ -3483,9 +3407,9 @@ mod tests {
 
         let text = EntryRenderer::plain_text_from_parts(&parts);
         assert_eq!(text, "my_crate::worker::db: ");
-        assert_eq!(parts[1], Part::new("::", Color::DarkGrey, false));
-        assert_eq!(parts[3], Part::new("::", Color::DarkGrey, false));
-        assert_eq!(parts[5], Part::new(": ", Color::DarkGrey, false));
+        assert_eq!(parts[1], Part::new("::", Color::DarkGray, false));
+        assert_eq!(parts[3], Part::new("::", Color::DarkGray, false));
+        assert_eq!(parts[5], Part::new(": ", Color::DarkGray, false));
     }
 
     #[test]
@@ -3499,7 +3423,7 @@ mod tests {
             parts[3],
             Part::new(
                 " span{path=other::module}".to_string(),
-                Color::DarkGrey,
+                Color::DarkGray,
                 false
             )
         );
@@ -3557,11 +3481,11 @@ mod tests {
             r#"au revoir (lang="fr" ok=true count=7 none=null)"#
         );
         assert_eq!(parts[0], Part::new("au revoir", Color::White, false));
-        assert_eq!(parts[2], Part::new("lang", Color::Blue, true));
-        assert_eq!(parts[4], Part::new("\"fr\"", Color::Green, false));
+        assert_eq!(parts[2], Part::new("lang", Color::LightBlue, true));
+        assert_eq!(parts[4], Part::new("\"fr\"", Color::LightGreen, false));
         assert_eq!(parts[8], Part::new("true", Color::Reset, false));
         assert_eq!(parts[12], Part::new("7", Color::Reset, false));
-        assert_eq!(parts[16], Part::new("null", Color::DarkGrey, false));
+        assert_eq!(parts[16], Part::new("null", Color::DarkGray, false));
     }
 
     #[test]
@@ -3582,7 +3506,7 @@ mod tests {
         assert_eq!(parts[2], Part::new("id", span_key_color(), false));
         assert_eq!(parts[3], Part::new("=", span_punctuation_color(), false));
         assert_eq!(parts[4], Part::new("7", span_value_color("7"), false));
-        assert_eq!(parts[6], Part::new(": ", Color::DarkGrey, false));
+        assert_eq!(parts[6], Part::new(": ", Color::DarkGray, false));
         assert_eq!(parts[7], Part::new("db", span_name_color("db"), false));
         assert_eq!(parts[10], Part::new("=", span_punctuation_color(), false));
         assert_eq!(parts[11], Part::new("\"select\"", string_color(), false));
@@ -3603,7 +3527,7 @@ mod tests {
                 false
             )
         );
-        assert_eq!(parts[1], Part::new(": ", Color::DarkGrey, false));
+        assert_eq!(parts[1], Part::new(": ", Color::DarkGray, false));
         assert_eq!(
             parts[2],
             Part::new(

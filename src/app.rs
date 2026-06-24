@@ -53,8 +53,11 @@ fn event_loop(
     loop {
         let page_size = content_rows(terminal::size()?.1, &state);
 
-        if event::poll(Duration::ZERO)? {
-            if handle_terminal_event(
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
+            let outcome = handle_terminal_event(
                 event::read()?,
                 terminal,
                 input,
@@ -62,10 +65,11 @@ fn event_loop(
                 &mut state,
                 exit_status.is_some() || input_finished,
                 page_size,
-            )? {
+            )?;
+            if outcome.exit {
                 return Ok(());
             }
-            dirty = true;
+            dirty |= outcome.redraw;
         }
 
         for _ in 0..MAX_EVENTS_PER_TICK {
@@ -116,14 +120,14 @@ fn event_loop(
         }
 
         if dirty && last_draw.elapsed() >= Duration::from_millis(16) {
-            let mut stdout = terminal.stdout()?;
-            draw(&mut *stdout, &entries, &state, exit_status, input_finished)?;
+            let mut tui = terminal.terminal()?;
+            tui.draw(|frame| draw(frame, &entries, &state, exit_status, input_finished))?;
             last_draw = Instant::now();
             dirty = false;
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if handle_terminal_event(
+            let outcome = handle_terminal_event(
                 event::read()?,
                 terminal,
                 input,
@@ -131,12 +135,19 @@ fn event_loop(
                 &mut state,
                 exit_status.is_some() || input_finished,
                 page_size,
-            )? {
+            )?;
+            if outcome.exit {
                 return Ok(());
             }
-            dirty = true;
+            dirty |= outcome.redraw;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TerminalEventOutcome {
+    exit: bool,
+    redraw: bool,
 }
 
 fn handle_terminal_event(
@@ -147,24 +158,48 @@ fn handle_terminal_event(
     state: &mut ViewState,
     input_finished: bool,
     page_size: usize,
-) -> Result<bool> {
+) -> Result<TerminalEventOutcome> {
+    let redraw = terminal_event_requests_redraw(&event);
     match event {
-        Event::Key(key) => handle_terminal_key(
-            key,
-            terminal,
-            input,
-            entries,
-            state,
-            input_finished,
-            page_size,
-        ),
+        Event::Key(key) => Ok(TerminalEventOutcome {
+            exit: handle_terminal_key(
+                key,
+                terminal,
+                input,
+                entries,
+                state,
+                input_finished,
+                page_size,
+            )?,
+            redraw,
+        }),
         Event::Mouse(mouse) => {
             let action = handle_mouse(mouse, entries, state, input_finished, page_size);
             debug_assert_eq!(action, KeyAction::Continue);
-            Ok(false)
+            Ok(TerminalEventOutcome {
+                exit: false,
+                redraw,
+            })
         }
-        _ => Ok(false),
+        Event::Resize(_, _) => Ok(TerminalEventOutcome {
+            exit: false,
+            redraw,
+        }),
+        _ => Ok(TerminalEventOutcome::default()),
     }
+}
+
+fn terminal_event_requests_redraw(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(_)
+            | Event::Resize(_, _)
+            | Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp
+                    | crossterm::event::MouseEventKind::ScrollDown,
+                ..
+            })
+    )
 }
 
 fn handle_terminal_key(
@@ -193,5 +228,37 @@ fn handle_terminal_key(
             input.terminate();
             std::process::exit(130);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+    fn mouse_event(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn mouse_motion_does_not_request_redraw() {
+        assert!(!terminal_event_requests_redraw(&mouse_event(
+            MouseEventKind::Moved
+        )));
+    }
+
+    #[test]
+    fn mouse_wheel_requests_redraw() {
+        assert!(terminal_event_requests_redraw(&mouse_event(
+            MouseEventKind::ScrollUp
+        )));
+        assert!(terminal_event_requests_redraw(&mouse_event(
+            MouseEventKind::ScrollDown
+        )));
     }
 }
