@@ -1851,12 +1851,7 @@ fn search_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
     }
 
     let matches = search_match_indices(entries, state).len();
-    let prefix = if state.search_editing {
-        "search /"
-    } else {
-        "search "
-    };
-    format!(" | {prefix}{} ({matches} results)", state.search_query)
+    format!(" | search: {} ({matches} results)", state.search_query)
 }
 
 #[derive(Default)]
@@ -2673,7 +2668,7 @@ mod tests {
         assert_eq!(search_match_indices(&entries, &state), vec![1, 2]);
 
         let status = status_line(&entries, &state, None, false);
-        assert!(status.contains("search /er (2 results)"));
+        assert!(status.contains("search: er (2 results)"));
     }
 
     #[test]
