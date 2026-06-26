@@ -107,6 +107,7 @@ fn event_loop(
                         timestamp: None,
                         level: Level::Error,
                         parsed: false,
+                        thread: None,
                         target: Some("traceviewer".to_string()),
                         spans: Vec::new(),
                         values: Vec::new(),

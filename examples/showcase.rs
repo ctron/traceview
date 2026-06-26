@@ -1,4 +1,4 @@
-use std::{env, io};
+use std::{env, io, thread};
 
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::{filter::LevelFilter, prelude::*, registry::Registry};
@@ -38,6 +38,7 @@ fn main() {
     };
 
     let repeat = option_usize(&args, "--repeat").unwrap_or(1);
+    let show_threads = args.iter().any(|arg| arg == "--threads");
     match format {
         Format::Plain => emit_plain(repeat),
         Format::EnvLogger => {
@@ -46,12 +47,12 @@ fn main() {
         }
         Format::Logfmt => emit_logfmt(repeat),
         Format::Tracing => {
-            init_tracing_fmt();
-            emit_tracing_records(repeat);
+            init_tracing_fmt(show_threads);
+            emit_tracing_records(repeat, show_threads);
         }
         Format::Bunyan => {
             init_bunyan();
-            emit_tracing_records(repeat);
+            emit_tracing_records(repeat, false);
         }
     }
 }
@@ -71,10 +72,12 @@ fn init_env_logger() {
         .init();
 }
 
-fn init_tracing_fmt() {
+fn init_tracing_fmt(show_threads: bool) {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::TRACE)
+        .with_thread_names(show_threads)
+        .with_thread_ids(show_threads)
         .with_target(true)
         .init();
 }
@@ -150,7 +153,7 @@ fn emit_logfmt(repeat: usize) {
     }
 }
 
-fn emit_tracing_records(repeat: usize) {
+fn emit_tracing_records(repeat: usize, show_threads: bool) {
     for pass in 0..repeat {
         tracing::info!(
             target: "showcase::server",
@@ -224,6 +227,43 @@ fn emit_tracing_records(repeat: usize) {
                 "failed to process job"
             );
         }
+
+        if show_threads {
+            emit_threaded_tracing_records(pass);
+        }
+    }
+}
+
+fn emit_threaded_tracing_records(pass: usize) {
+    let handles = [
+        thread::Builder::new()
+            .name("showcase-ingest".to_string())
+            .spawn(move || {
+                tracing::info!(
+                    target: "showcase::ingest",
+                    pass = pass + 1,
+                    batch_id = "batch-42",
+                    records = 256,
+                    "accepted ingest batch"
+                );
+            })
+            .expect("spawn ingest showcase thread"),
+        thread::Builder::new()
+            .name("showcase-export".to_string())
+            .spawn(move || {
+                tracing::debug!(
+                    target: "showcase::export",
+                    pass = pass + 1,
+                    destination = "warehouse",
+                    queued = 32,
+                    "queued export work"
+                );
+            })
+            .expect("spawn export showcase thread"),
+    ];
+
+    for handle in handles {
+        handle.join().expect("join showcase thread");
     }
 }
 
@@ -233,13 +273,14 @@ fn print_help() {
 traceviewer showcase example
 
 Usage:
-  cargo run --example showcase -- <plain|env-logger|logfmt|tracing|bunyan> [--repeat N]
+  cargo run --example showcase -- <plain|env-logger|logfmt|tracing|bunyan> [--repeat N] [--threads]
 
 Examples:
   cargo run --example showcase -- tracing
+  cargo run --example showcase -- tracing --threads
   cargo run --example showcase -- logfmt
   cargo run --example showcase -- bunyan
-  cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing
+  cargo run --bin tv -- --format tracing -- cargo run --example showcase -- tracing --threads
   cargo run --bin tv -- --format logfmt -- cargo run --example showcase -- logfmt
   cargo run --bin tv -- --format bunyan -- cargo run --example showcase -- bunyan
   cargo run --bin tv -- --format env-logger -- cargo run --example showcase -- env-logger

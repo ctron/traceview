@@ -26,6 +26,8 @@ const HELP_LINES: &[&str] = &[
     "",
     "Actions",
     "  f               focus selected target, or clear focus",
+    "  t               focus selected thread, or clear focus",
+    "  T               toggle thread information",
     "  s               toggle span information",
     "  r               toggle raw log line display",
     "  1..5            filter all, debug+, info+, warn+, error",
@@ -54,12 +56,14 @@ pub(crate) struct ViewState {
     pub(crate) selected: Option<usize>,
     pub(crate) help_visible: bool,
     pub(crate) values: ValuesPaneState,
+    pub(crate) show_threads: bool,
     pub(crate) show_spans: bool,
     pub(crate) show_raw: bool,
     pub(crate) search_query: String,
     pub(crate) search_editing: bool,
     pub(crate) search_wrapped: bool,
     pub(crate) focus_target: Option<String>,
+    pub(crate) focus_thread: Option<String>,
     pub(crate) level_filter: LevelFilter,
 }
 
@@ -120,6 +124,7 @@ impl LevelFilter {
 impl ViewState {
     pub(crate) fn new() -> Self {
         Self {
+            show_threads: true,
             show_spans: true,
             ..Self::default()
         }
@@ -160,6 +165,17 @@ impl ViewState {
             self.selected
                 .and_then(|selected| entries.get(selected))
                 .and_then(|entry| entry.target.clone())
+        };
+        self.scroll_selected_into_view(entries, page_size);
+    }
+
+    fn toggle_thread_focus(&mut self, entries: &VecDeque<LogEntry>, page_size: usize) {
+        self.focus_thread = if self.focus_thread.is_some() {
+            None
+        } else {
+            self.selected
+                .and_then(|selected| entries.get(selected))
+                .and_then(|entry| entry.thread.clone())
         };
         self.scroll_selected_into_view(entries, page_size);
     }
@@ -468,6 +484,14 @@ fn handle_normal_key(
         }
         KeyCode::Char('s') => {
             state.show_spans = !state.show_spans;
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('T') => {
+            state.show_threads = !state.show_threads;
+            return KeyAction::Continue;
+        }
+        KeyCode::Char('t') => {
+            state.toggle_thread_focus(entries, page_size);
             return KeyAction::Continue;
         }
         KeyCode::Char('r') => {
@@ -1023,6 +1047,10 @@ fn entry_visible(entry: &LogEntry, state: &ViewState) -> bool {
             .focus_target
             .as_deref()
             .is_none_or(|target| entry.target.as_deref() == Some(target))
+        && state
+            .focus_thread
+            .as_deref()
+            .is_none_or(|thread| entry.thread.as_deref() == Some(thread))
 }
 
 fn selected_visible_pos(visible: &[usize], selected: Option<usize>) -> Option<usize> {
@@ -1103,6 +1131,7 @@ fn search_match_indices(entries: &VecDeque<LogEntry>, state: &ViewState) -> Vec<
 
 #[derive(Clone, Debug)]
 struct RenderOptions {
+    show_threads: bool,
     show_spans: bool,
     show_raw: bool,
     search_query: String,
@@ -1111,6 +1140,7 @@ struct RenderOptions {
 impl From<&ViewState> for RenderOptions {
     fn from(state: &ViewState) -> Self {
         Self {
+            show_threads: state.show_threads,
             show_spans: state.show_spans,
             show_raw: state.show_raw,
             search_query: state.search_query.clone(),
@@ -1297,6 +1327,11 @@ impl EntryRenderer {
                 true,
             ));
         }
+        if self.options.show_threads
+            && let Some(thread) = &entry.thread
+        {
+            self.push_thread_parts(&mut parts, thread);
+        }
         if let Some(target) = &entry.target {
             self.push_target_parts(&mut parts, target);
         }
@@ -1338,6 +1373,11 @@ impl EntryRenderer {
             parts.push(Part::new(suffix, Color::DarkGray, false));
         }
         parts.push(Part::new(": ", Color::DarkGray, false));
+    }
+
+    fn push_thread_parts(&self, parts: &mut Vec<Part>, thread: &str) {
+        parts.push(Part::new(thread, thread_color(thread), false));
+        parts.push(Part::new(" ", Color::DarkGray, false));
     }
 
     fn push_span_parts(&self, parts: &mut Vec<Part>, spans: &[String]) {
@@ -1779,18 +1819,15 @@ fn status_line(
         None if input_finished => "loaded".to_string(),
         None => "running".to_string(),
     };
-    let focus = state
-        .focus_target
-        .as_deref()
-        .map(|target| focus_status(entries, target))
-        .unwrap_or_default();
+    let focus = focus_status(entries, state);
     let levels = LevelCounts::from_entries(entries, state).summary();
     let search = search_status(entries, state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={} | spans {} | raw {} | ? help ",
+        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={} | threads {} | spans {} | raw {} | ? help ",
         state.level_filter.status_label(),
         state.x_offset,
+        if state.show_threads { "on" } else { "off" },
         if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
         entries = entry_count
@@ -1825,12 +1862,10 @@ struct LevelCounts {
 impl LevelCounts {
     fn from_entries(entries: &VecDeque<LogEntry>, state: &ViewState) -> Self {
         let mut counts = Self::default();
-        for entry in entries.iter().filter(|entry| {
-            state
-                .focus_target
-                .as_deref()
-                .is_none_or(|target| entry.target.as_deref() == Some(target))
-        }) {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry_visible_for_focus(entry, state))
+        {
             counts.add(entry.level);
         }
         counts
@@ -1855,13 +1890,38 @@ impl LevelCounts {
     }
 }
 
-fn focus_status(entries: &VecDeque<LogEntry>, target: &str) -> String {
+fn focus_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
+    let mut labels = Vec::new();
+    if let Some(target) = &state.focus_target {
+        labels.push(format!("target {target}"));
+    }
+    if let Some(thread) = &state.focus_thread {
+        labels.push(format!("thread {thread}"));
+    }
+    if labels.is_empty() {
+        return String::new();
+    }
+
     let hidden = entries
         .iter()
-        .filter(|entry| entry.target.as_deref() != Some(target))
+        .filter(|entry| !entry_visible_for_focus(entry, state))
         .count();
     let percent = hidden_percentage(hidden, entries.len());
-    format!(" | focus {target} ({hidden} hidden, {percent}%)")
+    format!(
+        " | focus {} ({hidden} hidden, {percent}%)",
+        labels.join(", ")
+    )
+}
+
+fn entry_visible_for_focus(entry: &LogEntry, state: &ViewState) -> bool {
+    state
+        .focus_target
+        .as_deref()
+        .is_none_or(|target| entry.target.as_deref() == Some(target))
+        && state
+            .focus_thread
+            .as_deref()
+            .is_none_or(|thread| entry.thread.as_deref() == Some(thread))
 }
 
 fn hidden_percentage(hidden: usize, total: usize) -> usize {
@@ -1891,6 +1951,21 @@ const fn stream_color(stream: Stream) -> Color {
 
 fn span_name_color(span: &str) -> Color {
     span_palette_color(stable_hash(span) % SPAN_PALETTE_SIZE)
+}
+
+fn thread_color(thread: &str) -> Color {
+    thread_palette_color(stable_hash(thread) % THREAD_PALETTE_SIZE)
+}
+
+const THREAD_PALETTE_SIZE: usize = 64;
+
+fn thread_palette_color(index: usize) -> Color {
+    let hue = (index as f32 * 360.0 / THREAD_PALETTE_SIZE as f32 + 240.0) % 360.0;
+    let saturation = 0.40 + ((index / 16) as f32 * 0.08);
+    let lightness = 0.60 + ((index / 8) % 2) as f32 * 0.08;
+    let (r, g, b) = hsl_to_rgb(hue, saturation.min(0.72), lightness.min(0.72));
+
+    Color::Rgb(r, g, b)
 }
 
 const SPAN_PALETTE_SIZE: usize = 64;
@@ -2005,6 +2080,7 @@ mod tests {
                 timestamp: None,
                 level: Level::Info,
                 parsed: true,
+                thread: None,
                 target: None,
                 spans: Vec::new(),
                 values: Vec::new(),
@@ -2021,6 +2097,7 @@ mod tests {
             timestamp: None,
             level,
             parsed: true,
+            thread: None,
             target: None,
             spans: Vec::new(),
             values: Vec::new(),
@@ -2036,7 +2113,24 @@ mod tests {
             timestamp: None,
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: target.map(str::to_string),
+            spans: Vec::new(),
+            values: Vec::new(),
+            message: message.to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        }
+    }
+
+    fn entry_with_thread(thread: &str, target: &str, message: &str) -> LogEntry {
+        LogEntry {
+            raw: format!("raw {message}"),
+            timestamp: None,
+            level: Level::Info,
+            parsed: true,
+            thread: Some(thread.to_string()),
+            target: Some(target.to_string()),
             spans: Vec::new(),
             values: Vec::new(),
             message: message.to_string(),
@@ -2055,6 +2149,7 @@ mod tests {
             timestamp: None,
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: None,
             spans: Vec::new(),
             values,
@@ -2109,6 +2204,7 @@ mod tests {
     fn renderer() -> EntryRenderer {
         EntryRenderer {
             options: RenderOptions {
+                show_threads: true,
                 show_spans: true,
                 show_raw: false,
                 search_query: String::new(),
@@ -2289,23 +2385,35 @@ mod tests {
     }
 
     #[test]
-    fn compact_help_page_shows_raw_toggle() {
+    fn compact_help_page_shows_thread_controls() {
         let mut output = test_buffer(80, 6);
 
         draw_help_page(&mut output, Rect::new(0, 0, 80, 6));
         let text = buffer_text(&output);
 
-        assert!(text.contains("r               toggle raw log line display"));
+        assert!(text.contains("t               focus selected thread, or clear focus"));
+        assert!(text.contains("T               toggle thread information"));
     }
 
     #[test]
     fn help_page_shows_level_filter_shortcuts() {
-        let mut output = test_buffer(80, 8);
+        let mut output = test_buffer(80, 9);
 
-        draw_help_page(&mut output, Rect::new(0, 0, 80, 8));
+        draw_help_page(&mut output, Rect::new(0, 0, 80, 9));
         let text = buffer_text(&output);
 
         assert!(text.contains("1..5            filter all, debug+, info+, warn+, error"));
+    }
+
+    #[test]
+    fn help_page_shows_thread_toggle() {
+        let mut output = test_buffer(80, 6);
+
+        draw_help_page(&mut output, Rect::new(0, 0, 80, 6));
+        let text = buffer_text(&output);
+
+        assert!(text.contains("t               focus selected thread, or clear focus"));
+        assert!(text.contains("T               toggle thread information"));
     }
 
     #[test]
@@ -2322,6 +2430,22 @@ mod tests {
 
         handle_key(key(KeyCode::Char('s')), &entries, &mut state, false, 5);
         assert!(state.show_spans);
+    }
+
+    #[test]
+    fn uppercase_t_toggles_thread_information() {
+        let entries = entries(1);
+        let mut state = ViewState::new();
+
+        assert!(state.show_threads);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('T')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert!(!state.show_threads);
+
+        handle_key(key(KeyCode::Char('T')), &entries, &mut state, false, 5);
+        assert!(state.show_threads);
     }
 
     #[test]
@@ -2821,6 +2945,7 @@ mod tests {
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: Some("svc".to_string()),
             spans: Vec::new(),
             values: Vec::new(),
@@ -2843,6 +2968,7 @@ mod tests {
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: Some("svc".to_string()),
             spans: Vec::new(),
             values: Vec::new(),
@@ -2873,6 +2999,7 @@ mod tests {
             timestamp: None,
             level: Level::Unknown,
             parsed: false,
+            thread: None,
             target: None,
             spans: Vec::new(),
             values: Vec::new(),
@@ -2958,6 +3085,62 @@ mod tests {
     }
 
     #[test]
+    fn t_focuses_selected_thread_and_clears_focus() {
+        let entries = VecDeque::from([
+            entry_with_thread("worker-1", "alpha", "one"),
+            entry_with_thread("worker-2", "alpha", "two"),
+            entry_with_thread("worker-1", "beta", "three"),
+        ]);
+        let mut state = ViewState {
+            selected: Some(2),
+            first_visible: 2,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            handle_key(key(KeyCode::Char('t')), &entries, &mut state, false, 5),
+            KeyAction::Continue
+        );
+        assert_eq!(state.focus_thread.as_deref(), Some("worker-1"));
+        assert_eq!(visible_indices(&entries, &state), vec![0, 2]);
+        assert_eq!(state.selected, Some(2));
+
+        handle_key(key(KeyCode::Char('t')), &entries, &mut state, false, 5);
+        assert_eq!(state.focus_thread, None);
+        assert_eq!(visible_indices(&entries, &state), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn t_without_selected_thread_keeps_thread_focus_clear() {
+        let entries = VecDeque::from([entry_with_target(Some("alpha"), "plain")]);
+        let mut state = ViewState {
+            selected: Some(0),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Char('t')), &entries, &mut state, false, 5);
+
+        assert_eq!(state.focus_thread, None);
+        assert_eq!(visible_indices(&entries, &state), vec![0]);
+    }
+
+    #[test]
+    fn thread_focus_combines_with_target_focus() {
+        let entries = VecDeque::from([
+            entry_with_thread("worker-1", "alpha", "one"),
+            entry_with_thread("worker-1", "beta", "two"),
+            entry_with_thread("worker-2", "alpha", "three"),
+        ]);
+        let state = ViewState {
+            focus_target: Some("alpha".to_string()),
+            focus_thread: Some("worker-1".to_string()),
+            ..ViewState::new()
+        };
+
+        assert_eq!(visible_indices(&entries, &state), vec![0]);
+    }
+
+    #[test]
     fn focus_status_shows_hidden_line_count_and_percentage() {
         let entries = VecDeque::from([
             entry_with_target(Some("alpha"), "one"),
@@ -2973,7 +3156,24 @@ mod tests {
 
         let status = status_line(&entries, &state, None, false);
 
-        assert!(status.contains("focus alpha (2 hidden, 50%)"));
+        assert!(status.contains("focus target alpha (2 hidden, 50%)"));
+    }
+
+    #[test]
+    fn focus_status_shows_thread_focus() {
+        let entries = VecDeque::from([
+            entry_with_thread("worker-1", "alpha", "one"),
+            entry_with_thread("worker-2", "alpha", "two"),
+            entry_with_thread("worker-1", "beta", "three"),
+        ]);
+        let state = ViewState {
+            focus_thread: Some("worker-1".to_string()),
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, false);
+
+        assert!(status.contains("focus thread worker-1 (1 hidden, 33%)"));
     }
 
     #[test]
@@ -3116,6 +3316,7 @@ mod tests {
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
             values: Vec::new(),
@@ -3135,6 +3336,43 @@ mod tests {
     }
 
     #[test]
+    fn selected_line_text_includes_thread_when_shown() {
+        let entries = VecDeque::from([entry_with_thread(
+            "worker-1",
+            "my_crate::worker",
+            "loaded user",
+        )]);
+        let state = ViewState {
+            selected: Some(0),
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| INFO  worker-1 my_crate::worker: loaded user")
+        );
+    }
+
+    #[test]
+    fn selected_line_text_omits_thread_when_hidden() {
+        let entries = VecDeque::from([entry_with_thread(
+            "worker-1",
+            "my_crate::worker",
+            "loaded user",
+        )]);
+        let state = ViewState {
+            selected: Some(0),
+            show_threads: false,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| INFO  my_crate::worker: loaded user")
+        );
+    }
+
+    #[test]
     fn selected_line_text_omits_spans_when_hidden() {
         let entries = VecDeque::from([LogEntry {
             raw: "2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\""
@@ -3142,6 +3380,7 @@ mod tests {
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
             values: Vec::new(),
@@ -3169,6 +3408,7 @@ mod tests {
             timestamp: Some("2026-06-15T12:01:02Z".to_string()),
             level: Level::Info,
             parsed: true,
+            thread: None,
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
             values: Vec::new(),
@@ -3372,6 +3612,30 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn thread_colors_are_stable_for_same_thread() {
+        assert_eq!(thread_color("worker-1"), thread_color("worker-1"));
+    }
+
+    #[test]
+    fn thread_parts_use_thread_specific_colors() {
+        let mut parts = Vec::new();
+        renderer().push_thread_parts(&mut parts, "worker-1");
+
+        assert_eq!(
+            parts[0],
+            Part::new("worker-1", thread_color("worker-1"), false)
+        );
+        assert_eq!(parts[1], Part::new(" ", Color::DarkGray, false));
+    }
+
+    #[test]
+    fn thread_palette_is_separate_from_target_and_span_palettes() {
+        assert_eq!(THREAD_PALETTE_SIZE, 64);
+        assert_ne!(thread_color("worker-1"), target_module_color("worker-1"));
+        assert_ne!(thread_color("worker-1"), span_name_color("worker-1"));
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub(crate) struct LogEntry {
     pub(crate) timestamp: Option<String>,
     pub(crate) level: Level,
     pub(crate) parsed: bool,
+    pub(crate) thread: Option<String>,
     pub(crate) target: Option<String>,
     pub(crate) spans: Vec<String>,
     pub(crate) values: Vec<TraceValueSection>,

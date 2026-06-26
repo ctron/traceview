@@ -29,6 +29,7 @@ pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> 
             Level::Unknown
         },
         timestamp: None,
+        thread: None,
         target: None,
         spans: Vec::new(),
         values: Vec::new(),
@@ -106,6 +107,7 @@ fn parse_env_logger(raw: &str) -> Option<LogEntry> {
         timestamp,
         level,
         parsed: true,
+        thread: None,
         target,
         spans: Vec::new(),
         values: Vec::new(),
@@ -171,6 +173,7 @@ fn parse_logfmt(raw: &str, stream: Stream) -> Option<LogEntry> {
         timestamp,
         level,
         parsed: true,
+        thread: None,
         target,
         spans: Vec::new(),
         values,
@@ -277,7 +280,7 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
         (Some(first.to_string()), parse_level(second)?, rest)
     };
 
-    let (target, spans, message) = split_tracing_target_message(rest);
+    let (thread, target, spans, message) = split_tracing_target_message(rest);
     let mut values = span_value_sections(&spans);
     let (message_parts, message_values) = tracing_message_parts(&message);
     if !message_values.is_empty() {
@@ -290,6 +293,7 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
         timestamp,
         level,
         parsed: true,
+        thread,
         target,
         spans,
         values,
@@ -324,6 +328,7 @@ fn parse_bunyan(raw: &str, stream: Stream) -> Option<LogEntry> {
         timestamp,
         level,
         parsed: true,
+        thread: None,
         target,
         spans: Vec::new(),
         values: Vec::new(),
@@ -680,17 +685,74 @@ fn take_token(value: &str) -> Option<(&str, &str)> {
     Some((token, rest))
 }
 
-fn split_tracing_target_message(rest: &str) -> (Option<String>, Vec<String>, String) {
+fn split_tracing_target_message(
+    rest: &str,
+) -> (Option<String>, Option<String>, Vec<String>, String) {
+    let (thread, rest) = extract_tracing_thread_prefix(rest);
     let (mut spans, rest) = extract_leading_spans(rest);
 
     if let Some(idx) = find_target_separator(rest) {
         let target = rest[..idx].trim().to_string();
         let (more_spans, message) = extract_leading_spans(rest[idx + 1..].trim_start());
         spans.extend(more_spans);
-        return (non_empty(target), spans, message.to_string());
+        return (thread, non_empty(target), spans, message.to_string());
     }
 
-    (None, spans, rest.to_string())
+    (thread, None, spans, rest.to_string())
+}
+
+fn extract_tracing_thread_prefix(rest: &str) -> (Option<String>, &str) {
+    let rest = rest.trim_start();
+    if let Some((thread_id, rest)) = take_leading_thread_id(rest) {
+        return (Some(thread_id.to_string()), rest.trim_start());
+    }
+
+    let Some((thread_name, rest_after_name)) = take_token(rest) else {
+        return (None, rest);
+    };
+
+    if let Some((thread_id, rest)) = take_leading_thread_id(rest_after_name) {
+        return (
+            Some(format!("{thread_name} ({thread_id})")),
+            rest.trim_start(),
+        );
+    }
+
+    if looks_like_thread_name_prefix(thread_name, rest_after_name) {
+        return (Some(thread_name.to_string()), rest_after_name.trim_start());
+    }
+
+    (None, rest)
+}
+
+fn take_leading_thread_id(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    let after_prefix = rest.strip_prefix("ThreadId(")?;
+    let close = after_prefix.find(')')?;
+    let end = "ThreadId(".len() + close + 1;
+    let after = &rest[end..];
+    if after.is_empty() || starts_with_whitespace(after) {
+        Some((&after_prefix[..close], after))
+    } else {
+        None
+    }
+}
+
+fn looks_like_thread_name_prefix(thread_name: &str, rest_after_name: &str) -> bool {
+    if thread_name.contains(':') || thread_name.contains('{') || thread_name.contains('}') {
+        return false;
+    }
+
+    let rest_after_name = rest_after_name.trim_start();
+    let (spans, rest_after_spans) = extract_leading_spans(rest_after_name);
+    if find_target_separator(rest_after_spans).is_none() {
+        return false;
+    }
+
+    !spans.is_empty()
+        || rest_after_spans
+            .split_once(':')
+            .is_some_and(|(target, _)| !target.trim().contains(char::is_whitespace))
 }
 
 fn find_target_separator(rest: &str) -> Option<usize> {
@@ -936,7 +998,50 @@ mod tests {
             entry.timestamp.as_deref(),
             Some("2026-06-15T12:01:02.123456Z")
         );
+        assert_eq!(entry.thread, None);
         assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
+        assert_eq!(entry.message, "retrying request");
+    }
+
+    #[test]
+    fn parses_tracing_thread_id_before_target() {
+        let entry = parse_tracing(
+            "2026-06-15T12:01:02.123456Z  INFO ThreadId(01) my_crate::worker: retrying request",
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.thread.as_deref(), Some("01"));
+        assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
+        assert!(entry.spans.is_empty());
+        assert_eq!(entry.message, "retrying request");
+    }
+
+    #[test]
+    fn parses_tracing_thread_name_and_id_before_target() {
+        let entry = parse_tracing(
+            "2026-06-15T12:01:02.123456Z  INFO worker-1 ThreadId(07) my_crate::worker: retrying request",
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.thread.as_deref(), Some("worker-1 (07)"));
+        assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
+        assert!(entry.spans.is_empty());
+        assert_eq!(entry.message, "retrying request");
+    }
+
+    #[test]
+    fn parses_tracing_thread_name_before_spans() {
+        let entry = parse_tracing(
+            "2026-06-15T12:01:02.123456Z  INFO worker-1 request{id=7}: my_crate::worker: retrying request",
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.thread.as_deref(), Some("worker-1"));
+        assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
+        assert_eq!(entry.spans, vec!["request{id=7}".to_string()]);
         assert_eq!(entry.message, "retrying request");
     }
 
