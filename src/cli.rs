@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
     trailing_var_arg = true
 )]
 pub(crate) struct Cli {
-    /// Log parser to use. Auto currently recognizes bunyan, env_logger, logfmt, and tracing fmt defaults.
+    /// Log parser to use. Auto detects common structured log formats.
     #[arg(
         short,
         long,
@@ -65,6 +65,7 @@ fn parse_byte_size(value: &str) -> Result<NonZeroUsize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_plain_max_line_bytes() {
@@ -117,5 +118,14 @@ mod tests {
             .expect_err("file and command should conflict");
 
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn format_help_does_not_duplicate_possible_values() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+
+        assert!(help.contains("Auto detects common structured log formats"));
+        assert!(!help.contains("Auto currently recognizes bunyan"));
     }
 }
