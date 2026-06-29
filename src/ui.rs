@@ -1938,10 +1938,9 @@ fn status_line(
     let display = display_status(state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{selection}{follow}{focus}{search} | lvl {levels} | {} | x={}{display} | raw {} | ? help ",
+        " {process} | line {selected}/{entries}{selection}{follow}{focus}{search} | lvl {levels} | {} | x={}{display} | ? help ",
         state.level_filter.status_label(),
         state.x_offset,
-        if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
     status
@@ -1998,6 +1997,9 @@ fn display_status(state: &ViewState) -> String {
     }
     if !state.show_spans {
         status.push_str(" | spans off");
+    }
+    if state.show_raw {
+        status.push_str(" | raw on");
     }
     status
 }
@@ -3504,6 +3506,8 @@ mod tests {
 
         assert!(!status.contains("threads on"));
         assert!(!status.contains("spans on"));
+        assert!(!status.contains("raw off"));
+        assert!(!status.contains("raw on"));
     }
 
     #[test]
@@ -3519,6 +3523,19 @@ mod tests {
 
         assert!(status.contains("threads off"));
         assert!(status.contains("spans off"));
+    }
+
+    #[test]
+    fn status_shows_raw_state_only_when_enabled() {
+        let entries = entries(1);
+        let state = ViewState {
+            show_raw: true,
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, false);
+
+        assert!(status.contains("raw on"));
     }
 
     #[test]
