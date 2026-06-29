@@ -1,4 +1,4 @@
-use std::{cmp, collections::VecDeque, process::ExitStatus};
+use std::{cmp, collections::VecDeque, ops::RangeInclusive, process::ExitStatus, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::model::{Level, LogEntry, MessagePart, Stream, TraceValue, TraceValueField};
+use jiff::{SignedDuration, Timestamp};
 
 const STATUS_BAR_FOREGROUND: Color = Color::Black;
 const STATUS_BAR_BACKGROUND: Color = Color::White;
@@ -35,7 +36,8 @@ const HELP_LINES: &[&str] = &[
     "  /               search raw log lines",
     "  n / b           jump to next or previous search result",
     "  Esc             clear search, close help, or close values pane",
-    "  y               copy selected line or value to clipboard",
+    "  Shift+move      select multiple rows",
+    "  y               copy selected line, rows, or value to clipboard",
     "  ?               toggle this help page",
     "  q               exit after the process ends",
     "  Ctrl-C          kill process and exit",
@@ -54,6 +56,7 @@ pub(crate) struct ViewState {
     pub(crate) x_offset: usize,
     pub(crate) first_visible: usize,
     pub(crate) selected: Option<usize>,
+    pub(crate) selection_anchor: Option<usize>,
     pub(crate) help_visible: bool,
     pub(crate) values: ValuesPaneState,
     pub(crate) show_threads: bool,
@@ -139,6 +142,7 @@ impl ViewState {
     pub(crate) fn remove_first_line(&mut self) {
         self.first_visible = self.first_visible.saturating_sub(1);
         self.selected = self.selected.map(|selected| selected.saturating_sub(1));
+        self.selection_anchor = self.selection_anchor.map(|anchor| anchor.saturating_sub(1));
     }
 
     fn clear_search(&mut self) {
@@ -249,6 +253,21 @@ impl ViewState {
         self.scroll_selected_into_visible_slice(visible, page_size);
     }
 
+    fn move_selected_to_with_selection(
+        &mut self,
+        visible: &[usize],
+        selected_visible: usize,
+        page_size: usize,
+        extending_selection: bool,
+    ) {
+        if extending_selection {
+            self.start_selection(visible);
+        } else {
+            self.clear_selection();
+        }
+        self.move_selected_to(visible, selected_visible, page_size);
+    }
+
     fn move_selected_by(&mut self, visible: &[usize], delta: isize, page_size: usize) {
         let Some(selected_pos) = selected_visible_pos(visible, self.selected) else {
             return;
@@ -265,6 +284,34 @@ impl ViewState {
         self.move_selected_to(visible, selected_pos, page_size);
     }
 
+    fn move_selected_by_with_selection(
+        &mut self,
+        visible: &[usize],
+        delta: isize,
+        page_size: usize,
+        extending_selection: bool,
+    ) {
+        if extending_selection {
+            self.start_selection(visible);
+        } else {
+            self.clear_selection();
+        }
+        self.move_selected_by(visible, delta, page_size);
+    }
+
+    fn start_selection(&mut self, visible: &[usize]) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = self
+                .selected
+                .filter(|selected| visible.contains(selected))
+                .or_else(|| visible.last().copied());
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
     fn scroll_selected_into_view(&mut self, entries: &VecDeque<LogEntry>, page_size: usize) {
         let visible = visible_indices(entries, self);
         self.scroll_selected_into_visible_slice(&visible, page_size);
@@ -278,12 +325,20 @@ impl ViewState {
         let Some(selected_pos) = visible.iter().position(|idx| *idx == selected) else {
             self.first_visible = visible.first().copied().unwrap_or(0);
             self.selected = visible.last().copied();
+            self.clear_selection();
             return;
         };
         if visible.is_empty() {
             self.first_visible = 0;
             self.selected = None;
+            self.clear_selection();
             return;
+        }
+        if self
+            .selection_anchor
+            .is_some_and(|anchor| !visible.contains(&anchor))
+        {
+            self.clear_selection();
         }
 
         let page_size = cmp::max(1, page_size);
@@ -352,7 +407,7 @@ pub(crate) fn handle_mouse(
     };
 
     handle_key(
-        KeyEvent::new(key, KeyModifiers::NONE),
+        KeyEvent::new(key, mouse.modifiers),
         entries,
         state,
         process_exited,
@@ -464,6 +519,7 @@ fn handle_normal_key(
     if state.values.mode != ValuesPaneMode::Closed {
         return handle_values_key(key, entries, state);
     }
+    let extending_selection = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
         KeyCode::Char('?') => {
@@ -531,6 +587,10 @@ fn handle_normal_key(
             return KeyAction::Continue;
         }
         KeyCode::Char('y') => return KeyAction::CopySelected,
+        KeyCode::Esc if state.selection_anchor.is_some() => {
+            state.clear_selection();
+            return KeyAction::Continue;
+        }
         KeyCode::Esc if !state.search_query.is_empty() => {
             state.clear_search();
             return KeyAction::Continue;
@@ -544,14 +604,33 @@ fn handle_normal_key(
         KeyCode::Right => {
             state.x_offset = state.x_offset.saturating_add(HORIZONTAL_SCROLL_STEP);
         }
-        KeyCode::Home => state.move_selected_to(&visible, 0, page_size),
-        KeyCode::End => {
-            state.move_selected_to(&visible, visible.len().saturating_sub(1), page_size)
+        KeyCode::Home => {
+            state.move_selected_to_with_selection(&visible, 0, page_size, extending_selection)
         }
-        KeyCode::Up => state.move_selected_by(&visible, -1, page_size),
-        KeyCode::Down => state.move_selected_by(&visible, 1, page_size),
-        KeyCode::PageUp => state.move_selected_by(&visible, -(page_step as isize), page_size),
-        KeyCode::PageDown => state.move_selected_by(&visible, page_step as isize, page_size),
+        KeyCode::End => state.move_selected_to_with_selection(
+            &visible,
+            visible.len().saturating_sub(1),
+            page_size,
+            extending_selection,
+        ),
+        KeyCode::Up => {
+            state.move_selected_by_with_selection(&visible, -1, page_size, extending_selection)
+        }
+        KeyCode::Down => {
+            state.move_selected_by_with_selection(&visible, 1, page_size, extending_selection)
+        }
+        KeyCode::PageUp => state.move_selected_by_with_selection(
+            &visible,
+            -(page_step as isize),
+            page_size,
+            extending_selection,
+        ),
+        KeyCode::PageDown => state.move_selected_by_with_selection(
+            &visible,
+            page_step as isize,
+            page_size,
+            extending_selection,
+        ),
         _ => {}
     }
 
@@ -665,6 +744,7 @@ fn draw_frame(
         .selected
         .filter(|selected| visible.contains(selected))
         .or_else(|| visible.last().copied());
+    let selected_range = selected_row_range(&visible, state);
     let start_pos = visible
         .iter()
         .position(|idx| *idx == state.first_visible)
@@ -680,7 +760,11 @@ fn draw_frame(
         let Some(entry) = entries.get(idx) else {
             continue;
         };
-        let is_selected = Some(idx) == selected;
+        let visible_pos = start_pos + screen_row;
+        let is_selected = selected_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&visible_pos))
+            || Some(idx) == selected;
         render_entry_line(
             buffer,
             Rect::new(
@@ -834,6 +918,18 @@ pub(crate) fn selected_line_text(
 ) -> Option<String> {
     if state.values.mode != ValuesPaneMode::Closed {
         return selected_value_text(entries, state);
+    }
+
+    let visible = visible_indices(entries, state);
+    if let Some(range) = selected_row_range(&visible, state) {
+        let renderer = EntryRenderer::from(state);
+        let text = visible[range]
+            .iter()
+            .filter_map(|idx| entries.get(*idx))
+            .map(|entry| renderer.plain_text(entry))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (!text.is_empty()).then_some(text);
     }
 
     entries
@@ -1039,6 +1135,22 @@ fn selected_entry_for_values<'a>(
         .filter(|selected| visible.contains(selected))
         .or_else(|| visible.last().copied())?;
     entries.get(selected)
+}
+
+#[cfg(test)]
+fn selected_row_indices(visible: &[usize], state: &ViewState) -> Vec<usize> {
+    let Some(range) = selected_row_range(visible, state) else {
+        return Vec::new();
+    };
+    visible[range].to_vec()
+}
+
+fn selected_row_range(visible: &[usize], state: &ViewState) -> Option<RangeInclusive<usize>> {
+    let anchor = state.selection_anchor?;
+    let selected = state.selected?;
+    let anchor_pos = visible.iter().position(|idx| *idx == anchor)?;
+    let selected_pos = visible.iter().position(|idx| *idx == selected)?;
+    Some(cmp::min(anchor_pos, selected_pos)..=cmp::max(anchor_pos, selected_pos))
 }
 
 fn entry_visible(entry: &LogEntry, state: &ViewState) -> bool {
@@ -1820,18 +1932,63 @@ fn status_line(
         None => "running".to_string(),
     };
     let focus = focus_status(entries, state);
+    let selection = selection_status(entries, state);
     let levels = LevelCounts::from_entries(entries, state).summary();
     let search = search_status(entries, state);
     let display = display_status(state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={}{display} | raw {} | ? help ",
+        " {process} | line {selected}/{entries}{selection}{follow}{focus}{search} | lvl {levels} | {} | x={}{display} | raw {} | ? help ",
         state.level_filter.status_label(),
         state.x_offset,
         if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
     status
+}
+
+fn selection_status(entries: &VecDeque<LogEntry>, state: &ViewState) -> String {
+    let visible = visible_indices(entries, state);
+    let Some(range) = selected_row_range(&visible, state) else {
+        return String::new();
+    };
+    let selected_count = range.end() - range.start() + 1;
+    if selected_count <= 1 {
+        return String::new();
+    }
+    format!(
+        " | sel {} lines | dt {}",
+        selected_count,
+        selection_duration(entries, visible[*range.start()], visible[*range.end()])
+            .unwrap_or_else(|| "--".to_string())
+    )
+}
+
+fn selection_duration(
+    entries: &VecDeque<LogEntry>,
+    first_idx: usize,
+    last_idx: usize,
+) -> Option<String> {
+    let first = entries
+        .get(first_idx)?
+        .timestamp
+        .as_deref()?
+        .parse::<Timestamp>()
+        .ok()?;
+    let last = entries
+        .get(last_idx)?
+        .timestamp
+        .as_deref()?
+        .parse::<Timestamp>()
+        .ok()?;
+    Some(format_signed_duration(last.duration_since(first)))
+}
+
+fn format_signed_duration(duration: SignedDuration) -> String {
+    let nanos = duration.as_nanos();
+    let sign = if nanos < 0 { "-" } else { "" };
+    let duration = Duration::from_nanos(nanos.unsigned_abs().try_into().unwrap_or(u64::MAX));
+    format!("{sign}{}", humantime::format_duration(duration))
 }
 
 fn display_status(state: &ViewState) -> String {
@@ -2144,6 +2301,22 @@ mod tests {
         }
     }
 
+    fn entry_with_timestamp(timestamp: &str, message: &str) -> LogEntry {
+        LogEntry {
+            raw: format!("{timestamp} INFO svc: {message}"),
+            timestamp: Some(timestamp.to_string()),
+            level: Level::Info,
+            parsed: true,
+            thread: None,
+            target: Some("svc".to_string()),
+            spans: Vec::new(),
+            values: Vec::new(),
+            message: message.to_string(),
+            message_parts: Vec::new(),
+            stream: Stream::Stdout,
+        }
+    }
+
     fn entry_with_values(values: Vec<TraceValueField>) -> LogEntry {
         entry_with_value_sections(vec![TraceValueSection::new("event", values)])
     }
@@ -2168,12 +2341,25 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
     fn mouse(kind: MouseEventKind) -> MouseEvent {
         MouseEvent {
             kind,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn shift_mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
         }
     }
 
@@ -2330,6 +2516,113 @@ mod tests {
 
         assert_eq!(state.selected, Some(0));
         assert_eq!(state.values.selected, Some(1));
+    }
+
+    #[test]
+    fn shift_down_starts_and_extends_row_selection() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            selected: Some(4),
+            ..ViewState::new()
+        };
+
+        handle_key(shift_key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selection_anchor, Some(4));
+        assert_eq!(state.selected, Some(5));
+        assert_eq!(
+            selected_row_indices(&visible_indices(&entries, &state), &state),
+            vec![4, 5]
+        );
+
+        handle_key(shift_key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selection_anchor, Some(4));
+        assert_eq!(state.selected, Some(6));
+        assert_eq!(
+            selected_row_indices(&visible_indices(&entries, &state), &state),
+            vec![4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn shift_up_selects_rows_in_visible_order() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            selected: Some(4),
+            ..ViewState::new()
+        };
+
+        handle_key(shift_key(KeyCode::Up), &entries, &mut state, false, 5);
+
+        assert_eq!(state.selection_anchor, Some(4));
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(
+            selected_row_indices(&visible_indices(&entries, &state), &state),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn shift_page_and_end_extend_row_selection() {
+        let entries = entries(20);
+        let mut state = ViewState {
+            selected: Some(10),
+            ..ViewState::new()
+        };
+
+        handle_key(shift_key(KeyCode::PageDown), &entries, &mut state, false, 6);
+        assert_eq!(state.selection_anchor, Some(10));
+        assert_eq!(state.selected, Some(15));
+
+        handle_key(shift_key(KeyCode::End), &entries, &mut state, false, 6);
+        assert_eq!(state.selection_anchor, Some(10));
+        assert_eq!(state.selected, Some(19));
+        assert_eq!(
+            selected_row_indices(&visible_indices(&entries, &state), &state),
+            (10..=19).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shift_mouse_wheel_extends_row_selection() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            selected: Some(4),
+            ..ViewState::new()
+        };
+
+        handle_mouse(
+            shift_mouse(MouseEventKind::ScrollDown),
+            &entries,
+            &mut state,
+            false,
+            5,
+        );
+
+        assert_eq!(state.selection_anchor, Some(4));
+        assert_eq!(state.selected, Some(5));
+        assert_eq!(
+            selected_row_indices(&visible_indices(&entries, &state), &state),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn plain_navigation_and_escape_clear_row_selection() {
+        let entries = entries(10);
+        let mut state = ViewState {
+            selected: Some(4),
+            selection_anchor: Some(2),
+            ..ViewState::new()
+        };
+
+        handle_key(key(KeyCode::Down), &entries, &mut state, false, 5);
+        assert_eq!(state.selection_anchor, None);
+        assert_eq!(state.selected, Some(5));
+
+        state.selection_anchor = Some(3);
+        handle_key(key(KeyCode::Esc), &entries, &mut state, false, 5);
+        assert_eq!(state.selection_anchor, None);
+        assert_eq!(state.selected, Some(5));
     }
 
     #[test]
@@ -3367,6 +3660,63 @@ mod tests {
     }
 
     #[test]
+    fn selected_line_text_copies_selected_row_range() {
+        let entries = entries(4);
+        let state = ViewState {
+            selected: Some(3),
+            selection_anchor: Some(1),
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| INFO  line 1\n| INFO  line 2\n| INFO  line 3")
+        );
+    }
+
+    #[test]
+    fn selected_line_text_copies_row_range_with_display_options() {
+        let entries = VecDeque::from([
+            entry_with_thread("worker-1", "svc", "first"),
+            entry_with_thread("worker-2", "svc", "second"),
+        ]);
+        let state = ViewState {
+            selected: Some(1),
+            selection_anchor: Some(0),
+            show_threads: false,
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("| INFO  svc: first\n| INFO  svc: second")
+        );
+    }
+
+    #[test]
+    fn values_pane_copy_ignores_row_range() {
+        let entries = VecDeque::from([entry_with_values(vec![
+            TraceValueField::new("id", TraceValue::Number("7".to_string())),
+            TraceValueField::new("tag", TraceValue::String("admin".to_string())),
+        ])]);
+        let state = ViewState {
+            selected: Some(0),
+            selection_anchor: Some(0),
+            values: ValuesPaneState {
+                mode: ValuesPaneMode::Sidebar,
+                selected: Some(1),
+                ..ValuesPaneState::default()
+            },
+            ..ViewState::new()
+        };
+
+        assert_eq!(
+            selected_line_text(&entries, &state).as_deref(),
+            Some("tag = \"admin\"")
+        );
+    }
+
+    #[test]
     fn selected_line_text_includes_thread_when_shown() {
         let entries = VecDeque::from([entry_with_thread(
             "worker-1",
@@ -3457,6 +3807,67 @@ mod tests {
             selected_line_text(&entries, &state).as_deref(),
             Some("| 2026-06-15T12:01:02Z INFO my_crate::worker: request{id=7}: loaded \"user\"")
         );
+    }
+
+    #[test]
+    fn selected_row_range_is_rendered_with_selected_style() {
+        let entries = entries(4);
+        let state = ViewState {
+            selected: Some(2),
+            selection_anchor: Some(1),
+            ..ViewState::new()
+        };
+        let mut buffer = test_buffer(40, 5);
+        let area = buffer.area;
+
+        draw_frame(&mut buffer, area, &entries, &state, None, true);
+
+        assert_eq!(buffer.cell((0, 0)).map(|cell| cell.bg), Some(Color::Reset));
+        assert_eq!(
+            buffer.cell((0, 1)).map(|cell| cell.bg),
+            Some(SELECTED_BACKGROUND)
+        );
+        assert_eq!(
+            buffer.cell((0, 2)).map(|cell| cell.bg),
+            Some(SELECTED_BACKGROUND)
+        );
+    }
+
+    #[test]
+    fn status_line_shows_selection_count_and_duration() {
+        let entries = VecDeque::from([
+            entry_with_timestamp("2026-06-15T12:01:02Z", "first"),
+            entry_with_timestamp("2026-06-15T12:01:03.250Z", "second"),
+            entry_with_timestamp("2026-06-15T12:01:04.003Z", "third"),
+        ]);
+        let state = ViewState {
+            selected: Some(2),
+            selection_anchor: Some(0),
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, true);
+
+        assert!(status.contains("line 3/3 | sel 3 lines"));
+        assert!(status.contains("dt 2s 3ms"));
+    }
+
+    #[test]
+    fn status_line_shows_duration_fallback_for_unparseable_selection_timestamps() {
+        let entries = VecDeque::from([
+            entry_with_timestamp("not-a-timestamp", "first"),
+            entry_with_timestamp("2026-06-15T12:01:03Z", "second"),
+        ]);
+        let state = ViewState {
+            selected: Some(1),
+            selection_anchor: Some(0),
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, true);
+
+        assert!(status.contains("sel 2 lines"));
+        assert!(status.contains("dt --"));
     }
 
     #[test]
