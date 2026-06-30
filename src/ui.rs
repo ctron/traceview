@@ -2852,29 +2852,31 @@ mod tests {
     }
 
     #[test]
-    fn y_copies_selected_value_when_values_pane_is_open() {
-        let entries = VecDeque::from([entry_with_values(vec![
-            TraceValueField::new("id", TraceValue::Number("7".to_string())),
-            TraceValueField::new("tag", TraceValue::String("admin".to_string())),
-        ])]);
-        let mut state = ViewState {
-            selected: Some(0),
-            values: ValuesPaneState {
-                mode: ValuesPaneMode::Sidebar,
-                selected: Some(1),
-                ..ValuesPaneState::default()
-            },
-            ..ViewState::new()
-        };
+    fn y_copies_selected_value_in_values_views() {
+        for mode in [ValuesPaneMode::Sidebar, ValuesPaneMode::Fullscreen] {
+            let entries = VecDeque::from([entry_with_values(vec![
+                TraceValueField::new("id", TraceValue::Number("7".to_string())),
+                TraceValueField::new("tag", TraceValue::String("admin".to_string())),
+            ])]);
+            let mut state = ViewState {
+                selected: Some(0),
+                values: ValuesPaneState {
+                    mode,
+                    selected: Some(1),
+                    ..ValuesPaneState::default()
+                },
+                ..ViewState::new()
+            };
 
-        assert_eq!(
-            handle_key(key(KeyCode::Char('y')), &entries, &mut state, false, 5),
-            KeyAction::CopySelected
-        );
-        assert_eq!(
-            selected_line_text(&entries, &state).as_deref(),
-            Some(r#"tag = "admin""#)
-        );
+            assert_eq!(
+                handle_key(key(KeyCode::Char('y')), &entries, &mut state, false, 5),
+                KeyAction::CopySelected
+            );
+            assert_eq!(
+                selected_line_text(&entries, &state).as_deref(),
+                Some(r#"tag = "admin""#)
+            );
+        }
     }
 
     #[test]

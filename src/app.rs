@@ -216,7 +216,8 @@ fn handle_terminal_key(
         KeyAction::Continue => Ok(false),
         KeyAction::CopySelected => {
             if let Some(line) = selected_line_text(entries, state) {
-                copy_to_clipboard(&line)?;
+                let mut tui = terminal.terminal()?;
+                copy_to_clipboard(&line, tui.backend_mut())?;
             }
             Ok(false)
         }

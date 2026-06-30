@@ -1,15 +1,15 @@
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use arboard::Clipboard;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-pub(crate) fn copy_to_clipboard(text: &str) -> Result<()> {
+pub(crate) fn copy_to_clipboard(text: &str, osc52_writer: &mut impl Write) -> Result<()> {
     if copy_to_arboard(text).is_ok() {
         return Ok(());
     }
 
-    copy_to_osc52(text)
+    copy_to_osc52(text, osc52_writer)
 }
 
 fn copy_to_arboard(text: &str) -> Result<()> {
@@ -17,10 +17,9 @@ fn copy_to_arboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn copy_to_osc52(text: &str) -> Result<()> {
-    let mut stdout = io::stdout();
-    write_osc52(text, &mut stdout)?;
-    stdout.flush()?;
+fn copy_to_osc52(text: &str, writer: &mut impl Write) -> Result<()> {
+    write_osc52(text, writer)?;
+    writer.flush()?;
     Ok(())
 }
 
